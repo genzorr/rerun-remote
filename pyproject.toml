@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rerun-remote"
+version = "0.2.1"
+description = "Open local and SSH-hosted RRD recordings in the native Rerun desktop viewer"
+requires-python = ">=3.11"
+dependencies = ["rerun-sdk==0.39.0"]
+
+[project.optional-dependencies]
+server = ["datafusion==54.0.0"]
+
+[project.scripts]
+rerun-remote = "rerun_remote.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rerun_remote"]
