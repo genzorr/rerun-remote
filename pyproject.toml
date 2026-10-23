@@ -4,9 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rerun-remote"
-version = "0.3.0"
+version = "0.4.0"
 description = "Open local and SSH-hosted RRD recordings and live streams in the native Rerun desktop viewer"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["rerun-sdk==0.40.0"]
 
 [project.optional-dependencies]
@@ -17,3 +19,6 @@ rerun-remote = "rerun_remote.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rerun_remote"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"LICENSE" = "rerun_remote/LICENSE"

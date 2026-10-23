@@ -121,7 +121,7 @@ class TestInputs(unittest.TestCase):
             output = root / "args.json"
             directory = root / "remote helper 'quoted'"
             directory.mkdir()
-            executable = directory / "rerun-remote"
+            executable = directory / "python3"
             executable.write_text('#!' + sys.executable + '\nimport json,sys\nfrom pathlib import Path\nPath(' + repr(str(output)) + ').write_text(json.dumps(sys.argv[1:]))\n')
             executable.chmod(0o755)
             recording = "/recordings/a $(touch " + str(root / "injected") + "); 'quoted'.rrd"
@@ -217,22 +217,14 @@ class TestInputs(unittest.TestCase):
         self.assertEqual(view.call_args.args[3], {"cpu_count": 1, "memory_bytes": 1234, "tasks_max": 45, "runtime_seconds": 67})
         self.assertEqual(view.call_args.kwargs["port"], 43210)
 
-    def test_remote_executable_falls_back_to_standard_uv_location(self):
+    def test_missing_remote_python_reports_bootstrap_prerequisite(self):
         with tempfile.TemporaryDirectory() as root:
-            home = Path(root) / "home with 'quotes'"
-            binary = home / ".local/bin/rerun-remote"
-            binary.parent.mkdir(parents=True)
-            binary.write_text("#!/bin/sh\nexit 42\n")
-            binary.chmod(0o755)
             command = cli.remote_command("example", "/literal.rrd", cli.DEFAULT_RESOURCES)
-            environment = dict(os.environ, HOME=str(home), PATH="/usr/bin:/bin")
-            self.assertEqual(subprocess.run(["/bin/sh", "-c", command[-1]], env=environment, timeout=5).returncode, 42)
-            binary.unlink()
-            result = subprocess.run(["/bin/sh", "-c", command[-1]], env=environment, capture_output=True, text=True, timeout=5)
+            result = subprocess.run(["/bin/sh", "-c", command[-1]], env=dict(os.environ, PATH=root), capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 127)
             self.assertEqual(result.stdout, "")
-            self.assertIn("rerun-remote[server] @ git+ssh://git@github.com/genzorr/rerun-remote.git", result.stderr)
-            self.assertIn("uv tool install", result.stderr)
+            self.assertIn("Python 3.10 or later", result.stderr)
+            self.assertNotIn("git+ssh", result.stderr)
 
 
 class TestVersion(unittest.TestCase):
@@ -292,6 +284,12 @@ class TestVersion(unittest.TestCase):
 
 
 class TestProcesses(unittest.TestCase):
+    def setUp(self):
+        from rerun_remote import _bootstrap
+        transfer = patch.object(_bootstrap, "transfer")
+        transfer.start()
+        self.addCleanup(transfer.stop)
+
     def spawn(self, source, **kwargs):
         return subprocess.Popen([sys.executable, "-c", source], start_new_session=True, **kwargs)
 
@@ -332,7 +330,8 @@ class TestProcesses(unittest.TestCase):
                     source = "\n".join((
                         "from pathlib import Path",
                         "from unittest.mock import patch",
-                        "from rerun_remote import cli",
+                        "from rerun_remote import cli, _bootstrap",
+                        "patch.object(_bootstrap,'transfer').start()",
                         "with patch.object(cli,'native_binary',return_value=Path(" + repr(str(native)) + ")), patch.object(cli,'port_available'), patch.object(cli,'remote_command',return_value=" + repr([sys.executable, "-c", ssh_source]) + "):",
                         "    raise SystemExit(cli.main(" + repr(arguments) + "))",
                     ))
