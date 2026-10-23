@@ -25,7 +25,7 @@ VERSION = "0.40.0"
 PORT = 38886
 DEFAULT_RESOURCES = {"memory_bytes": 4 * 1024**3, "tasks_max": 128, "runtime_seconds": 7200, "cpu_count": 2}
 CLIENT_INSTALL = "uv tool install --python 3.12 --reinstall --upgrade 'rerun-remote @ git+ssh://git@github.com/genzorr/rerun-remote.git'"
-SERVER_INSTALL = "uv tool install --python 3.12 --reinstall --upgrade 'rerun-remote[server] @ git+ssh://git@github.com/genzorr/rerun-remote.git'"
+SERVER_REPAIR = "Remote runtime is invalid; retry using a fresh isolated XDG_CACHE_HOME, or explicitly update the laptop client."
 ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 
@@ -79,28 +79,28 @@ def resolve_target(target: str) -> tuple[str | None, str, bool]:
 
 
 def native_binary(*, server: bool = False) -> Path:
-    remedy = SERVER_INSTALL if server else CLIENT_INSTALL
+    remedy = SERVER_REPAIR if server else f"Explicitly install or update with: {CLIENT_INSTALL}"
     try:
         installed = importlib.metadata.version("rerun-sdk")
         import rerun_cli
     except (ImportError, importlib.metadata.PackageNotFoundError) as error:
-        raise ViewError(f"Rerun is missing; explicitly install or update with: {remedy}") from error
+        raise ViewError(f"Rerun is missing. {remedy}") from error
     if installed != VERSION:
-        raise ViewError(f"Installed Rerun SDK is {installed}; expected {VERSION}. Explicitly reinstall on this machine with: {remedy}")
+        raise ViewError(f"Installed Rerun SDK is {installed}; expected {VERSION}. {remedy}")
     binary = Path(rerun_cli.__file__).with_name("rerun")
     if sys.platform == "darwin":
         bundled = binary.parent / "Rerun.app" / "Contents" / "MacOS" / "Rerun"
         if bundled.exists():
             binary = bundled
     if not binary.is_file() or not os.access(binary, os.X_OK):
-        raise ViewError(f"Bundled native Rerun executable is missing or not executable: {binary}. Explicitly reinstall with: {remedy}")
+        raise ViewError(f"Bundled native Rerun executable is missing or not executable: {binary}. {remedy}")
     try:
         with tempfile.TemporaryDirectory(prefix="rerun-remote-version-") as root:
             result = subprocess.run([str(binary), "--version"], env=isolated_environment(Path(root)), capture_output=True, text=True, timeout=10, check=True)
     except (OSError, subprocess.SubprocessError) as error:
-        raise ViewError(f"Cannot run bundled native Rerun; explicitly reinstall with: {remedy}") from error
+        raise ViewError(f"Cannot run bundled native Rerun. {remedy}") from error
     if not re.search(rf"\brerun(?:-cli)?\s+{re.escape(VERSION)}(?:\s|$)", result.stdout):
-        raise ViewError(f"Bundled native Rerun version differs from {VERSION}; explicitly reinstall with: {remedy}")
+        raise ViewError(f"Bundled native Rerun version differs from {VERSION}. {remedy}")
     return binary
 
 
@@ -296,9 +296,10 @@ def remote_command(host: str, recording: str, resources: dict, port: int = PORT)
     argv = ["_serve", "--recording", recording, "--port", str(port)]
     for key, value in resources.items():
         argv += ["--" + key.replace("_", "-"), str(value)]
-    missing = f"rerun-remote: remote executable missing; install explicitly with: {SERVER_INSTALL}; custom executable directories must be on the noninteractive SSH PATH."
-    resolver = 'executable=$(command -v rerun-remote) || executable="$HOME/.local/bin/rerun-remote"; if [ ! -x "$executable" ]; then printf "%s\\n" ' + shlex.quote(missing) + ' >&2; exit 127; fi; exec "$executable" '
-    return ssh_command(host, port, port) + [resolver + shlex.join(argv)]
+    from . import _bootstrap
+    source = Path(_bootstrap.__file__).read_text()
+    command = "command -v python3 >/dev/null 2>&1 || { printf '%s\\n' 'rerun-remote: remote setup requires Python 3.10 or later (python3 in PATH).' >&2; exit 127; }; exec python3 -I -c " + shlex.quote(source) + " " + shlex.join(argv[1:])
+    return ssh_command(host, port, port) + [command]
 
 
 def readiness(process: subprocess.Popen, timeout: float = 200, *, port: int = PORT) -> tuple[str, str | None]:
@@ -318,7 +319,7 @@ def readiness(process: subprocess.Popen, timeout: float = 200, *, port: int = PO
                 try:
                     response = json.loads(data.split(b"\n", 1)[0])
                     if response["version"] != VERSION:
-                        raise ViewError(f"Remote Rerun version must be {VERSION}; explicitly update rerun-remote on both machines.")
+                        raise ViewError(f"Remote Rerun version must be {VERSION}; explicitly update the laptop client.")
                     if not isinstance(response["segment_url"], str):
                         raise ValueError("invalid segment address")
                     url = urlsplit(response["segment_url"])
@@ -337,7 +338,7 @@ def retire_ssh(process: subprocess.Popen) -> None:
     if process.stdin is not None:
         try:
             process.stdin.close()
-        except BrokenPipeError:
+        except (BrokenPipeError, BlockingIOError):
             pass
     try:
         process.wait(timeout=10)
@@ -352,10 +353,15 @@ def remote_view(binary: Path, host: str, recording: str, resources: dict, reques
     ssh = subprocess.Popen(remote_command(host, recording, resources, port), stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
     desktop = None
     try:
-        segment_url, segment_id = readiness(ssh, port=port)
+        from . import _bootstrap
+        try:
+            _bootstrap.transfer(ssh, _bootstrap.source_payload())
+        except _bootstrap.SetupError as error:
+            raise ViewError(str(error)) from error
+        segment_url, segment_id = readiness(ssh, timeout=_bootstrap.SETUP_SECONDS + 200, port=port)
         control = control_port() if requested is not None else None
         if requested is not None and segment_id is None:
-            raise ViewError("Remote startup did not identify the selected recording; explicitly update rerun-remote on the execution host.")
+            raise ViewError("Remote startup did not identify the selected recording; retry with a fresh remote cache or update the laptop client.")
         desktop = viewer(binary, segment_url, resources["cpu_count"], control_port=control) if requested is not None else viewer(binary, segment_url, resources["cpu_count"])
         if requested is not None:
             initialize_time(desktop, control, requested, selected_segment=segment_id, ssh=ssh)
@@ -497,14 +503,15 @@ def serve_worker(args: argparse.Namespace) -> int:
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, terminate)
     resources = {key: getattr(args, key) for key in DEFAULT_RESOURCES}
+    verify_controls(args.unit, resources, os.getpid())
     binary = native_binary(server=True)
     selected = selected_file(args.recording)
     try:
         if importlib.metadata.version("datafusion") != "54.0.0":
-            raise ViewError(f"Remote catalog requires datafusion==54.0.0; explicitly install or update with: {SERVER_INSTALL}")
+            raise ViewError(f"Remote catalog requires datafusion==54.0.0. {SERVER_REPAIR}")
         from rerun.catalog import CatalogClient
     except (ImportError, importlib.metadata.PackageNotFoundError) as error:
-        raise ViewError(f"Remote catalog dependencies are missing; explicitly install or update with: {SERVER_INSTALL}") from error
+        raise ViewError(f"Remote catalog dependencies are missing. {SERVER_REPAIR}") from error
     verify_controls(args.unit, resources, os.getpid())
     port_available(args.port)
     disconnected = threading.Event()
@@ -579,7 +586,7 @@ def serve_worker(args: argparse.Namespace) -> int:
             watcher.join(timeout=1)
 
 
-def serve(args: argparse.Namespace) -> int:
+def server_preflight(args: argparse.Namespace) -> tuple[Path, list[int]]:
     if sys.platform != "linux":
         raise ViewError("Remote serving requires Linux, systemd user services and taskset.")
     selected = selected_file(args.recording)
@@ -589,10 +596,26 @@ def serve(args: argparse.Namespace) -> int:
     cpus = sorted(os.sched_getaffinity(0))[:resources["cpu_count"]]
     if len(cpus) != resources["cpu_count"]:
         raise ViewError("Requested CPU count exceeds the execution host's effective CPU affinity.")
+    port_available(args.port)
+    return selected, cpus
+
+
+def scope_command(args: argparse.Namespace, worker: list[str]) -> tuple[str, list[str]]:
+    _, cpus = server_preflight(args)
+    resources = {key: getattr(args, key) for key in DEFAULT_RESOURCES}
     unit = f"rerun-remote-{uuid.uuid4().hex}.scope"
-    command = ["systemd-run", "--user", "--scope", "--quiet", "--unit=" + unit, f"--property=MemoryMax={resources['memory_bytes']}", f"--property=TasksMax={resources['tasks_max']}", f"--property=RuntimeMaxSec={resources['runtime_seconds']}s", "taskset", "-c", ",".join(map(str, cpus)), sys.executable, "-m", "rerun_remote", "_worker", "--unit", unit, "--recording", str(selected), "--port", str(args.port)]
+    command = ["systemd-run", "--user", "--scope", "--quiet", "--unit=" + unit, f"--property=MemoryMax={resources['memory_bytes']}", f"--property=TasksMax={resources['tasks_max']}", f"--property=RuntimeMaxSec={resources['runtime_seconds']}s", "taskset", "-c", ",".join(map(str, cpus)), *worker]
+    return unit, command
+
+
+def serve(args: argparse.Namespace) -> int:
+    selected, _ = server_preflight(args)
+    resources = {key: getattr(args, key) for key in DEFAULT_RESOURCES}
+    worker = [sys.executable, "-m", "rerun_remote", "_worker", "--unit", "UNIT", "--recording", str(selected), "--port", str(args.port)]
     for key, value in resources.items():
-        command += ["--" + key.replace("_", "-"), str(value)]
+        worker += ["--" + key.replace("_", "-"), str(value)]
+    unit, command = scope_command(args, worker)
+    command[command.index("--unit") + 1] = unit
     try:
         process = subprocess.Popen(command, start_new_session=True)
     except OSError as error:

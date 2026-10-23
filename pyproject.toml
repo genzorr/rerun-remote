@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rerun-remote"
-version = "0.3.0"
+version = "0.4.0"
 description = "Open local and SSH-hosted RRD recordings and live streams in the native Rerun desktop viewer"
 requires-python = ">=3.11"
 dependencies = ["rerun-sdk==0.40.0"]
