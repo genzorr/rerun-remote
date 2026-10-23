@@ -42,3 +42,5 @@ See `rerun-remote --help` for exact startup-time selection and remote-file resou
 - Remote file serving requires Linux, Python 3.10 or later for the bootstrap, an existing systemd user manager, cgroup v2 memory/PID delegation and `taskset`. First-use setup needs HTTPS access to public dependency sources. Default limits are two CPUs, 4 GiB memory, 128 tasks and two hours; unavailable controls stop startup before dependency installation.
 - Remote files must contain one recording and at most one saved blueprint. Live history depends on the producer's buffer and is separate from saving a recording.
 - Server compatibility is managed automatically. Dependency pins live in [pyproject.toml](pyproject.toml); behavior and verification requirements live in [REQUIREMENTS.md](REQUIREMENTS.md).
+
+Licensed under [MIT](LICENSE).

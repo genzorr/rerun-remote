@@ -49,9 +49,13 @@ def profile_identity(manifest: dict) -> str:
 
 
 def source_payload() -> bytes:
+    package = Path(__file__).parent
+    license_path = package / "LICENSE"
+    if not license_path.is_file():
+        license_path = package.parent.parent / "LICENSE"
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
-        for path in sorted(Path(__file__).parent.glob("*.py")):
+        for path in [*sorted(package.glob("*.py")), license_path]:
             archive.writestr(zipfile.ZipInfo("rerun_remote/" + path.name, (2020, 1, 1, 0, 0, 0)), path.read_bytes())
     source = output.getvalue()
     validate_source(source)
@@ -66,12 +70,12 @@ def validate_source(source: bytes) -> None:
         with zipfile.ZipFile(io.BytesIO(source)) as archive:
             entries = archive.infolist()
             names = [entry.filename for entry in entries]
-            if len(entries) > 32 or len(set(names)) != len(names) or not {"rerun_remote/__init__.py", "rerun_remote/__main__.py", "rerun_remote/cli.py", "rerun_remote/_bootstrap.py"}.issubset(names):
+            if len(entries) > 32 or len(set(names)) != len(names) or not {"rerun_remote/__init__.py", "rerun_remote/__main__.py", "rerun_remote/cli.py", "rerun_remote/_bootstrap.py", "rerun_remote/LICENSE"}.issubset(names):
                 raise SetupError("Invalid source package entries.")
             if sum(entry.file_size for entry in entries) > MAX_PAYLOAD:
                 raise SetupError("Expanded source payload exceeds the supported bound.")
             for entry in entries:
-                if not re.fullmatch(r"rerun_remote/[a-z_][a-z_0-9]*\.py", entry.filename) or entry.compress_type != zipfile.ZIP_STORED or entry.flag_bits & 1 or (entry.external_attr >> 16) & 0o170000 not in (0, 0o100000):
+                if (entry.filename != "rerun_remote/LICENSE" and not re.fullmatch(r"rerun_remote/[a-z_][a-z_0-9]*\.py", entry.filename)) or entry.compress_type != zipfile.ZIP_STORED or entry.flag_bits & 1 or (entry.external_attr >> 16) & 0o170000 not in (0, 0o100000):
                     raise SetupError("Unsafe source package path or entry.")
                 archive.read(entry)
     except (zipfile.BadZipFile, RuntimeError, EOFError) as error:

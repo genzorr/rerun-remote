@@ -41,6 +41,20 @@ class TestPayload(unittest.TestCase):
             self.assertEqual(manifest, setup.profile_manifest(source))
             self.assertEqual(stream.read(), b"lifecycle")
 
+    def test_payload_carries_canonical_license_and_rejects_other_license_paths(self):
+        source = source_zip()
+        canonical = Path(__file__).resolve().parent.parent / "LICENSE"
+        with zipfile.ZipFile(io.BytesIO(source)) as archive:
+            self.assertEqual(archive.read("rerun_remote/LICENSE"), canonical.read_bytes())
+            for path in ("LICENSE", "rerun_remote/../LICENSE", "rerun_remote/LICENSE.txt"):
+                output = io.BytesIO()
+                with zipfile.ZipFile(output, "w") as invalid:
+                    for entry in archive.infolist():
+                        name = path if entry.filename == "rerun_remote/LICENSE" else entry.filename
+                        invalid.writestr(name, archive.read(entry))
+                with self.subTest(path=path), self.assertRaises(setup.SetupError):
+                    setup.validate_source(output.getvalue())
+
     def test_identity_uses_actual_source_and_exact_profile(self):
         original = source_zip()
         manifest = setup.profile_manifest(original)
