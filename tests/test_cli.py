@@ -4,10 +4,12 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -31,7 +33,7 @@ class TestInputs(unittest.TestCase):
     def test_missing_input_fails_before_viewer(self):
         with patch.object(cli, "native_binary") as native:
             with contextlib.redirect_stderr(io.StringIO()) as diagnostic:
-                status = cli.main(["view", "/nonexistent-rerun-remote-test.rrd"])
+                status = cli.main(["/nonexistent-rerun-remote-test.rrd"])
         self.assertEqual(status, 1)
         native.assert_not_called()
         self.assertIn("Cannot open recording", diagnostic.getvalue())
@@ -41,7 +43,7 @@ class TestInputs(unittest.TestCase):
             file = Path(root) / "selected $(touch surprise); 'quoted'.rrd"
             file.touch()
             with patch.object(cli, "native_binary", return_value=Path("/fake/native")), patch.object(cli, "local_view", return_value=0) as view:
-                self.assertEqual(cli.main(["view", str(file)]), 0)
+                self.assertEqual(cli.main([str(file)]), 0)
             self.assertEqual(view.call_args.args[1], str(file.resolve()))
             self.assertFalse((Path(root) / "surprise").exists())
 
@@ -59,34 +61,15 @@ class TestInputs(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text())[-1], str(recording))
             self.assertFalse((root / "surprise").exists())
 
-    def test_relative_host_path_needs_configuration(self):
-        config = {"hosts": {}, "resources": cli.DEFAULT_RESOURCES}
-        with self.assertRaisesRegex(cli.ViewError, "recording_dir"):
-            cli.resolve_target("recording.rrd", "example", config)
-        config["hosts"]["example"] = {"recording_dir": "/recordings with spaces"}
-        self.assertEqual(cli.resolve_target("recording.rrd", "example", config), ("example", "/recordings with spaces/recording.rrd"))
+    def test_remote_paths_must_be_absolute(self):
+        with self.assertRaisesRegex(cli.ViewError, "must be absolute"):
+            cli.resolve_target("example:recording.rrd")
+        self.assertEqual(cli.resolve_target("example:/recordings with spaces/recording.rrd"), ("example", "/recordings with spaces/recording.rrd", False))
 
     def test_host_cannot_inject_ssh_options(self):
         for alias in ("-oProxyCommand=bad", "a b", "user@host", "host;touch"):
             with self.subTest(alias=alias), self.assertRaises(cli.ViewError):
                 cli.host_alias(alias)
-
-    def test_configuration_validates_resources_and_absolute_paths(self):
-        invalid = ('[resources]\ncpu_count = true\n', '[resources]\nunknown = 2\n', '[hosts.example]\nrecording_dir = "relative"\n', '[hosts.example]\nexecutable = "some-command"\n')
-        with tempfile.TemporaryDirectory() as root:
-            file = Path(root) / "config.toml"
-            for text in invalid:
-                file.write_text(text)
-                with self.subTest(text=text), self.assertRaises(cli.ViewError):
-                    cli.load_config(file, True)
-            file.write_text('[hosts.example]\nrecording_dir = "/recordings"\nexecutable = "/tools with spaces/rerun-remote"\n[resources]\ncpu_count = 1\n')
-            config = cli.load_config(file, True)
-            self.assertEqual(config["resources"]["cpu_count"], 1)
-            self.assertEqual(config["resources"]["tasks_max"], 128)
-
-    def test_missing_explicit_config_is_reported(self):
-        with self.assertRaisesRegex(cli.ViewError, "does not exist"):
-            cli.load_config(Path("/nonexistent-rerun-remote-config"), True)
 
     def test_occupied_port_preserves_listener(self):
         with socket.socket() as owner:
@@ -136,16 +119,120 @@ class TestInputs(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             output = root / "args.json"
-            executable = root / "remote helper 'quoted'"
+            directory = root / "remote helper 'quoted'"
+            directory.mkdir()
+            executable = directory / "rerun-remote"
             executable.write_text('#!' + sys.executable + '\nimport json,sys\nfrom pathlib import Path\nPath(' + repr(str(output)) + ').write_text(json.dumps(sys.argv[1:]))\n')
             executable.chmod(0o755)
             recording = "/recordings/a $(touch " + str(root / "injected") + "); 'quoted'.rrd"
-            config = {"hosts": {"example": {"executable": str(executable)}}, "resources": cli.DEFAULT_RESOURCES}
-            command = cli.remote_command("example", recording, config)
-            subprocess.run(["sh", "-c", command[-1]], check=True, timeout=5)
+            command = cli.remote_command("example", recording, cli.DEFAULT_RESOURCES, 43210)
+            subprocess.run(["sh", "-c", command[-1]], env=dict(os.environ, PATH=str(directory) + os.pathsep + os.environ["PATH"]), check=True, timeout=5)
             arguments = json.loads(output.read_text())
             self.assertEqual(arguments[arguments.index("--recording") + 1], recording)
+            self.assertEqual(arguments[arguments.index("--port") + 1], "43210")
             self.assertFalse((root / "injected").exists())
+
+    @unittest.skipUnless(shutil.which("ssh"), "Requires the OpenSSH client")
+    def test_owned_ssh_connection_preserves_alias_settings_and_disables_multiplexing(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = Path(root) / "ssh_config"
+            config.write_text(f"Host example\n  HostName 127.0.0.1\n  User fixture\n  Port 22222\n  IdentityFile {root}/identity\n  ProxyJump fixture-jump\n  ControlMaster auto\n  ControlPath {root}/foreign-master\n")
+            command = cli.ssh_command("example", 43210, 9876)
+            result = subprocess.run(command[:1] + ["-F", str(config), "-G"] + command[1:], capture_output=True, text=True, check=True, timeout=5)
+            settings = dict(line.split(" ", 1) for line in result.stdout.splitlines())
+            self.assertEqual(settings.get("controlpath", "none"), "none")
+            self.assertEqual(settings["hostname"], "127.0.0.1")
+            self.assertEqual(settings["user"], "fixture")
+            self.assertEqual(settings["port"], "22222")
+            self.assertEqual(settings["identityfile"], f"{root}/identity")
+            self.assertEqual(settings["proxyjump"], "fixture-jump")
+
+    @unittest.skipUnless(shutil.which("ssh") and hasattr(socket, "AF_UNIX"), "Requires OpenSSH and Unix sockets")
+    def test_owned_ssh_never_contacts_preexisting_master(self):
+        with tempfile.TemporaryDirectory() as root, socket.socket(socket.AF_UNIX) as master, socket.socket() as reserved:
+            master_path = str(Path(root) / "foreign-master")
+            master.bind(master_path)
+            master.listen()
+            master.settimeout(.05)
+            reserved.bind(("127.0.0.1", 0))
+            upstream_port = reserved.getsockname()[1]
+            config = Path(root) / "ssh_config"
+            config.write_text(f"Host example\n  HostName 127.0.0.1\n  Port {upstream_port}\n  ControlMaster auto\n  ControlPath {master_path}\n")
+            contacted = threading.Event()
+            finished = threading.Event()
+            def watch_master():
+                while not finished.is_set():
+                    try:
+                        connection, _ = master.accept()
+                    except socket.timeout:
+                        continue
+                    contacted.set()
+                    connection.close()
+            watcher = threading.Thread(target=watch_master)
+            watcher.start()
+            try:
+                command = cli.ssh_command("example", cli.control_port(), 9876)
+                result = subprocess.run(command[:1] + ["-F", str(config)] + command[1:] + ["true"], capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 255)
+                self.assertFalse(contacted.is_set())
+                with socket.socket(socket.AF_UNIX) as probe:
+                    probe.connect(master_path)
+                    self.assertTrue(contacted.wait(timeout=1))
+            finally:
+                finished.set()
+                watcher.join(timeout=1)
+
+    def test_live_targets_preserve_supported_proxy_urls(self):
+        for url in ("rerun+http://127.0.0.1:9876/proxy", "rerun+http://localhost:123/proxy?name=a%20b&x=1", "rerun+http://[::1]:65535/proxy"):
+            with self.subTest(url=url):
+                self.assertEqual(cli.resolve_target(url), (None, url, True))
+                self.assertEqual(cli.resolve_target("example:" + url), ("example", url, True))
+
+    def test_invalid_live_targets_fail_before_native_discovery(self):
+        urls = ("rerun+https://127.0.0.1:9876/proxy", "http://127.0.0.1:9876/proxy", "rerun+http://example.com:9876/proxy", "rerun+http://127.0.0.1/proxy", "rerun+http://127.0.0.1:0/proxy", "rerun+http://127.0.0.1:65536/proxy", "rerun+http://a@127.0.0.1:9876/proxy", "rerun+http://127.0.0.1:9876/proxy#", "rerun+http://127.0.0.1:9876/other", "rerun+http://127.0.0.1:9876/proxy\n")
+        for url in urls:
+            for target in (url, "example:" + url):
+                with self.subTest(target=target), patch.object(cli, "native_binary") as native, contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(cli.main([target]), 1)
+                    native.assert_not_called()
+
+    def test_removed_forms_and_invalid_numeric_options_are_rejected(self):
+        for arguments in (["view", "example:/a.rrd"], ["--host", "example", "/a.rrd"], ["--config", "/config.toml", "example:/a.rrd"], ["--port", "0", "example:/a.rrd"], ["--port", "65536", "example:/a.rrd"], ["--port", "1.5", "example:/a.rrd"], ["--memory-bytes", "-1", "example:/a.rrd"], ["--cpu-count", "0", "example:/a.rrd"]):
+            with self.subTest(arguments=arguments), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                cli.main(arguments)
+            self.assertEqual(raised.exception.code, 2)
+
+    def test_irrelevant_options_fail_before_native_discovery(self):
+        with tempfile.TemporaryDirectory() as root:
+            recording = Path(root) / "local.rrd"
+            recording.touch()
+            for target, option in ((str(recording), "--port"), (str(recording), "--cpu-count"), ("rerun+http://127.0.0.1:9876/proxy", "--port"), ("example:rerun+http://127.0.0.1:9876/proxy", "--memory-bytes")):
+                with self.subTest(target=target, option=option), patch.object(cli, "native_binary") as native, contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(cli.main([target, option, "1"]), 1)
+                    native.assert_not_called()
+
+    def test_remote_file_options_reach_owned_session(self):
+        with patch.object(cli, "native_binary", return_value=Path("/native")), patch.object(cli, "remote_view", return_value=0) as view:
+            self.assertEqual(cli.main(["example:/file.rrd", "--port", "43210", "--cpu-count", "1", "--memory-bytes", "1234", "--tasks-max", "45", "--runtime-seconds", "67"]), 0)
+        self.assertEqual(view.call_args.args[3], {"cpu_count": 1, "memory_bytes": 1234, "tasks_max": 45, "runtime_seconds": 67})
+        self.assertEqual(view.call_args.kwargs["port"], 43210)
+
+    def test_remote_executable_falls_back_to_standard_uv_location(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root) / "home with 'quotes'"
+            binary = home / ".local/bin/rerun-remote"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\nexit 42\n")
+            binary.chmod(0o755)
+            command = cli.remote_command("example", "/literal.rrd", cli.DEFAULT_RESOURCES)
+            environment = dict(os.environ, HOME=str(home), PATH="/usr/bin:/bin")
+            self.assertEqual(subprocess.run(["/bin/sh", "-c", command[-1]], env=environment, timeout=5).returncode, 42)
+            binary.unlink()
+            result = subprocess.run(["/bin/sh", "-c", command[-1]], env=environment, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 127)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("rerun-remote[server] @ git+ssh://git@github.com/genzorr/rerun-remote.git", result.stderr)
+            self.assertIn("uv tool install", result.stderr)
 
 
 class TestVersion(unittest.TestCase):
@@ -191,7 +278,7 @@ class TestVersion(unittest.TestCase):
 
     def test_sdk_mismatch_requires_explicit_update(self):
         with patch.object(cli.importlib.metadata, "version", return_value="0.32.0"), patch.dict(sys.modules, {"rerun_cli": types.SimpleNamespace(__file__="/fake/__init__.py")}):
-            with self.assertRaisesRegex(cli.ViewError, "expected 0.39.0"):
+            with self.assertRaisesRegex(cli.ViewError, "expected 0.40.0"):
                 cli.native_binary()
 
     def test_native_mismatch_requires_explicit_update(self):
@@ -241,7 +328,7 @@ class TestProcesses(unittest.TestCase):
                         "print(" + repr(ready) + ",flush=True)",
                         "sys.stdin.read()",
                     ))
-                    arguments = ["view", "example:/recording.rrd"] if remote else ["view", str(recording)]
+                    arguments = ["example:/recording.rrd"] if remote else [str(recording)]
                     source = "\n".join((
                         "from pathlib import Path",
                         "from unittest.mock import patch",
@@ -280,7 +367,7 @@ class TestProcesses(unittest.TestCase):
             recording = Path(root) / "recording.rrd"
             recording.touch()
             with patch.object(cli, "native_binary", return_value=Path("/fake/native")), patch.object(cli, "local_view", return_value=0):
-                self.assertEqual(cli.main(["view", str(recording)]), 0)
+                self.assertEqual(cli.main([str(recording)]), 0)
         for signum, handler in before.items():
             self.assertIs(signal.getsignal(signum), handler)
 
@@ -318,10 +405,10 @@ class TestProcesses(unittest.TestCase):
 
     def test_remote_startup_failure_cleans_ssh(self):
         ssh = self.spawn("import time; print('invalid readiness',flush=True); time.sleep(60)", stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-        config = {"hosts": {}, "resources": cli.DEFAULT_RESOURCES}
+        resources = cli.DEFAULT_RESOURCES
         with patch.object(cli, "port_available"), patch.object(cli.subprocess, "Popen", return_value=ssh), patch.object(cli, "viewer") as desktop:
             with self.assertRaisesRegex(cli.ViewError, "invalid readiness"):
-                cli.remote_view(Path("/fake/native"), "example", "/recording.rrd", config)
+                cli.remote_view(Path("/fake/native"), "example", "/recording.rrd", resources)
         self.assertIsNotNone(ssh.poll())
         desktop.assert_not_called()
         ssh.stdout.close()
@@ -331,7 +418,7 @@ class TestProcesses(unittest.TestCase):
             recording = Path(root) / "invalid.rrd"
             recording.touch()
             native = Path(root) / "fake-native"
-            native.write_text("#!/bin/sh\nexit 9\n")
+            native.write_text("#!/bin/sh\nprintf 'native actionable startup failure\\n' >&2\nexit 9\n")
             native.chmod(0o755)
             source = "\n".join((
                 "import sys,types,resource",
@@ -349,6 +436,9 @@ class TestProcesses(unittest.TestCase):
                 diagnostic = process.stderr.read().decode()
                 self.assertEqual(status, 1)
                 self.assertIn("Native remote server exited before readiness", diagnostic)
+                self.assertIn("native actionable startup failure", diagnostic)
+                self.assertLess(len(diagnostic), 5000)
+                self.assertEqual(process.stdout.read(), b"")
                 self.assertNotIn("Fatal Python error", diagnostic)
                 self.assertFalse(process.stdin.closed)
             finally:
@@ -361,11 +451,11 @@ class TestProcesses(unittest.TestCase):
         ready = json.dumps({"version": cli.VERSION, "segment_url": f"rerun+http://127.0.0.1:{cli.PORT}/catalog/selected/segment"})
         ssh = self.spawn("import time; print(" + repr(ready) + ",flush=True); time.sleep(0.4)", stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         desktop = self.spawn("import time; time.sleep(60)")
-        config = {"hosts": {}, "resources": cli.DEFAULT_RESOURCES}
+        resources = cli.DEFAULT_RESOURCES
         try:
             with patch.object(cli, "port_available"), patch.object(cli.subprocess, "Popen", return_value=ssh), patch.object(cli, "viewer", return_value=desktop):
                 with self.assertRaisesRegex(cli.ViewError, "SSH connection ended"):
-                    cli.remote_view(Path("/fake/native"), "example", "/recording.rrd", config)
+                    cli.remote_view(Path("/fake/native"), "example", "/recording.rrd", resources)
             self.assertIsNotNone(desktop.poll())
             self.assertIsNotNone(ssh.poll())
         finally:
@@ -379,9 +469,9 @@ class TestProcesses(unittest.TestCase):
             ready = json.dumps({"version": cli.VERSION, "segment_url": f"rerun+http://127.0.0.1:{cli.PORT}/catalog/selected/segment"})
             ssh = self.spawn("import sys,pathlib; print(" + repr(ready) + ",flush=True); sys.stdin.read(); pathlib.Path(" + repr(str(marker)) + ").touch()", stdin=subprocess.PIPE, stdout=subprocess.PIPE)
             desktop = self.spawn("pass")
-            config = {"hosts": {}, "resources": cli.DEFAULT_RESOURCES}
+            resources = cli.DEFAULT_RESOURCES
             with patch.object(cli, "port_available"), patch.object(cli.subprocess, "Popen", return_value=ssh), patch.object(cli, "viewer", return_value=desktop):
-                self.assertEqual(cli.remote_view(Path("/fake/native"), "example", "/recording.rrd", config), 0)
+                self.assertEqual(cli.remote_view(Path("/fake/native"), "example", "/recording.rrd", resources), 0)
             self.assertTrue(marker.exists())
             self.assertIsNotNone(ssh.poll())
             ssh.stdout.close()
@@ -410,6 +500,60 @@ class TestProcesses(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 cli.local_view(Path("/fake/native"), "/recording.rrd")
         self.assertIsNotNone(process.poll())
+
+    def test_live_failure_retires_only_owned_viewer_and_tunnel(self):
+        for remote in (False, True):
+            with self.subTest(remote=remote):
+                producer = self.spawn("import time; time.sleep(60)")
+                desktop = self.spawn("import time; time.sleep(60)")
+                ssh = self.spawn("import time; time.sleep(60)") if remote else None
+                try:
+                    with patch.object(cli, "port_available"), patch.object(cli, "viewer_listener_owned", return_value=True), patch.object(cli.subprocess, "Popen", return_value=ssh) as launch, patch.object(cli, "viewer", return_value=desktop), patch.object(cli, "initialize_time", side_effect=cli.ViewError("upstream unavailable")):
+                        with self.assertRaisesRegex(cli.ViewError, "upstream unavailable"):
+                            cli.live_view(Path("/native"), "rerun+http://127.0.0.1:9876/proxy?name=a%20b", host="example" if remote else None, port=43210)
+                        if remote:
+                            command = launch.call_args.args[0]
+                            self.assertIn("-N", command)
+                            self.assertEqual(command[-1], "example")
+                            self.assertIn("127.0.0.1:43210:127.0.0.1:9876", command)
+                        else:
+                            launch.assert_not_called()
+                    self.assertIsNotNone(desktop.poll())
+                    if ssh is not None:
+                        self.assertIsNotNone(ssh.poll())
+                    self.assertIsNone(producer.poll())
+                finally:
+                    cli.stop_process(desktop)
+                    if ssh is not None:
+                        cli.stop_process(ssh)
+                    cli.stop_process(producer)
+
+    def test_remote_live_forwards_url_path_and_query_and_retires_on_ssh_loss(self):
+        ssh = self.spawn("import time; time.sleep(.4)")
+        desktop = self.spawn("import time; time.sleep(60)")
+        try:
+            with patch.object(cli, "port_available"), patch.object(cli, "viewer_listener_owned", return_value=True), patch.object(cli.subprocess, "Popen", return_value=ssh), patch.object(cli, "viewer", return_value=desktop) as view, patch.object(cli, "initialize_time"):
+                with self.assertRaisesRegex(cli.ViewError, "SSH connection ended"):
+                    cli.live_view(Path("/native"), "rerun+http://127.0.0.1:9876/proxy?name=a%20b&x=1", host="example", port=43210)
+                self.assertEqual(view.call_args.args[1], "rerun+http://127.0.0.1:43210/proxy?name=a%20b&x=1")
+            self.assertIsNotNone(desktop.poll())
+        finally:
+            cli.stop_process(desktop)
+            cli.stop_process(ssh)
+
+    def test_custom_readiness_port_accepts_only_matching_owned_server_address(self):
+        for port, expected in ((43210, True), (38886, False)):
+            response = json.dumps({"version": cli.VERSION, "segment_url": f"rerun+http://127.0.0.1:{port}/catalog/selected/segment", "segment_id": "selected"})
+            process = self.spawn("import time; print(" + repr(response) + ",flush=True); time.sleep(60)", stdout=subprocess.PIPE)
+            try:
+                if expected:
+                    self.assertEqual(cli.readiness(process, timeout=2, port=43210), (f"rerun+http://127.0.0.1:{port}/catalog/selected/segment", "selected"))
+                else:
+                    with self.assertRaisesRegex(cli.ViewError, "invalid readiness"):
+                        cli.readiness(process, timeout=2, port=43210)
+            finally:
+                cli.stop_process(process)
+                process.stdout.close()
 
 
 def select_ready(stream):
@@ -516,7 +660,7 @@ class TestStartupTime(unittest.TestCase):
                 self.client.set_time.assert_called_once()
 
     def test_wrong_recording_and_invalid_timeline_never_seek(self):
-        cases = ((self.state(store="Recording:application:foreign"), "different recording", {"selected_segment": "selected"}), (self.state(timeline="other"), "unavailable", {}), (self.state(time_type="sequence"), "duration or timestamp", {}), (self.state(start=0, end=10), "outside", {}), (self.state(start=None), "outside", {}), (self.state(version="0.38.0"), "expected 0.39.0", {}))
+        cases = ((self.state(store="Recording:application:foreign"), "different recording", {"selected_segment": "selected"}), (self.state(timeline="other"), "unavailable", {}), (self.state(time_type="sequence"), "duration or timestamp", {}), (self.state(start=0, end=10), "outside", {}), (self.state(start=None), "outside", {}), (self.state(version="0.38.0"), "expected 0.40.0", {}))
         for state, diagnostic, kwargs in cases:
             with self.subTest(diagnostic=diagnostic):
                 self.client.reset_mock()
@@ -539,6 +683,36 @@ class TestStartupTime(unittest.TestCase):
         with self.assertRaisesRegex(cli.ViewError, "exact cursor readback"):
             self.initialize(("arrival", 10), timeout=0.25)
         self.client.set_time.assert_called_once()
+
+    def test_live_readiness_waits_for_recording_without_seeking(self):
+        state = self.state(loading=True)
+        empty = self.state(loading=True)
+        empty.recordings = []
+        self.client.viewer_state.side_effect = [empty, state]
+        self.initialize(None, live=True)
+        self.client.set_time.assert_not_called()
+
+    def test_live_readiness_accepts_multiple_recordings_without_time(self):
+        state = self.state(loading=True)
+        state.recordings.append(self.state(store="Recording:application:second").recordings[0])
+        self.client.viewer_state.return_value = state
+        self.initialize(None, live=True)
+        self.client.set_time.assert_not_called()
+
+    def test_live_time_waits_for_future_data_then_seeks_once(self):
+        waiting = self.state(loading=True, end=9)
+        ready = self.state(loading=True, end=12, cursor=10)
+        self.client.viewer_state.side_effect = [waiting, ready, ready]
+        self.initialize(("arrival", 10), live=True)
+        self.client.set_time.assert_called_once()
+
+    def test_unavailable_live_endpoint_is_bounded_without_seeking(self):
+        state = self.state(loading=True)
+        state.recordings = []
+        self.client.viewer_state.return_value = state
+        with self.assertRaisesRegex(cli.ViewError, "live endpoint readiness timed out"):
+            self.initialize(None, live=True, timeout=.15)
+        self.client.set_time.assert_not_called()
 
     def test_loading_timeout_never_seeks(self):
         self.client.viewer_state.return_value = self.state(loading=True)
@@ -636,10 +810,10 @@ class TestStartupTime(unittest.TestCase):
             ssh = subprocess.Popen([sys.executable, "-c", source], stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
             desktop = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
             try:
-                config = {"hosts": {}, "resources": cli.DEFAULT_RESOURCES}
+                resources = cli.DEFAULT_RESOURCES
                 with patch.object(cli, "port_available"), patch.object(cli.subprocess, "Popen", return_value=ssh), patch.object(cli, "viewer", return_value=desktop), patch.object(cli, "initialize_time", side_effect=cli.ViewError("invalid timeline")):
                     with self.assertRaisesRegex(cli.ViewError, "invalid timeline"):
-                        cli.remote_view(Path("/fake/native"), "example", "/recording.rrd", config, ("arrival", 10))
+                        cli.remote_view(Path("/fake/native"), "example", "/recording.rrd", resources, ("arrival", 10))
                 self.assertIsNotNone(desktop.poll())
                 self.assertIsNotNone(ssh.poll())
                 self.assertTrue(marker.exists())
@@ -667,7 +841,7 @@ class TestStartupTime(unittest.TestCase):
                 "    def viewer_state(self):",
                 "        state=json.loads(FILE.read_text())",
                 "        recording=S(store_id='Recording:application:selected',timelines=[S(name='-arrival',time_type='timestamp',start=0,end=2**63-1)],current_timeline='-arrival',current_time=state['cursor'])",
-                "        return S(viewer_version='0.39.0',loading=[],recordings=[recording])",
+                "        return S(viewer_version='0.40.0',loading=[],recordings=[recording])",
                 "    def set_time(self,timeline,*,timestamp,play,recording):",
                 "        assert timeline=='-arrival' and recording=='Recording:application:selected' and play is False",
                 "        assert str(timestamp.dtype)=='datetime64[ns]'",
