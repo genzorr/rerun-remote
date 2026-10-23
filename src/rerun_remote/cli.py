@@ -1,9 +1,10 @@
-"""Open one RRD in the bundled native desktop viewer."""
+"""Open a recording or existing live stream in the native desktop viewer."""
 
 from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -17,14 +18,14 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
-VERSION = "0.39.0"
+VERSION = "0.40.0"
 PORT = 38886
-DEFAULT_CONFIG = Path.home() / ".config/rerun-remote/config.toml"
 DEFAULT_RESOURCES = {"memory_bytes": 4 * 1024**3, "tasks_max": 128, "runtime_seconds": 7200, "cpu_count": 2}
+CLIENT_INSTALL = "uv tool install --python 3.12 --reinstall --upgrade 'rerun-remote @ git+ssh://git@github.com/genzorr/rerun-remote.git'"
+SERVER_INSTALL = "uv tool install --python 3.12 --reinstall --upgrade 'rerun-remote[server] @ git+ssh://git@github.com/genzorr/rerun-remote.git'"
 ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 
@@ -38,41 +39,6 @@ def host_alias(value: str) -> str:
     return value
 
 
-def load_config(path: Path, explicit: bool = False) -> dict:
-    try:
-        with path.expanduser().open("rb") as source:
-            config = tomllib.load(source)
-    except FileNotFoundError:
-        if explicit:
-            raise ViewError(f"Configuration file does not exist: {path}") from None
-        config = {}
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        raise ViewError(f"Cannot read configuration: {error}") from error
-    if set(config) - {"hosts", "resources"}:
-        raise ViewError("Configuration supports only hosts and resources tables.")
-    hosts = config.get("hosts", {})
-    resources = config.get("resources", {})
-    if not isinstance(hosts, dict) or not isinstance(resources, dict):
-        raise ViewError("hosts and resources must be TOML tables.")
-    for alias, settings in hosts.items():
-        host_alias(alias)
-        if not isinstance(settings, dict) or set(settings) - {"recording_dir", "executable"}:
-            raise ViewError(f"Host {alias} supports recording_dir and executable only.")
-        for key, value in settings.items():
-            if not isinstance(value, str) or not value or "\0" in value:
-                raise ViewError(f"Host {alias} {key} must be a nonempty path string.")
-            if key == "recording_dir" and not value.startswith("/"):
-                raise ViewError(f"Host {alias} recording_dir must be an absolute remote directory.")
-            if key == "executable" and value != "rerun-remote" and not value.startswith("/"):
-                raise ViewError(f"Host {alias} executable must be rerun-remote or an absolute remote executable path.")
-    if set(resources) - DEFAULT_RESOURCES.keys():
-        raise ViewError("Unknown resource setting; use memory_bytes, tasks_max, runtime_seconds or cpu_count.")
-    for key, value in resources.items():
-        if type(value) is not int or value < 1:
-            raise ViewError(f"Resource {key} must be a positive integer.")
-    return {"hosts": hosts, "resources": DEFAULT_RESOURCES | resources}
-
-
 def selected_file(value: str) -> Path:
     try:
         path = Path(value).expanduser().resolve(strict=True)
@@ -83,46 +49,58 @@ def selected_file(value: str) -> Path:
     return path
 
 
-def resolve_target(recording: str, host: str | None, config: dict) -> tuple[str | None, str]:
-    if not recording or "\0" in recording:
-        raise ViewError("Recording path must be nonempty and cannot contain NUL.")
-    if host is None and ":" in recording and not recording.startswith(("/", "./", "../")):
-        host, recording = recording.split(":", 1)
-        if not recording.startswith("/"):
-            raise ViewError("host:path requires an absolute remote recording path; use --host for configured relative paths.")
-    if host is None:
-        return None, str(selected_file(recording))
-    host_alias(host)
-    if not recording.startswith("/"):
-        directory = config["hosts"].get(host, {}).get("recording_dir")
-        if directory is None:
-            raise ViewError(f"A relative remote path requires hosts.{host}.recording_dir in configuration.")
-        recording = str(Path(directory) / recording)
-    return host, recording
+def live_url(value: str) -> str:
+    try:
+        url = urlsplit(value)
+        loopback = url.hostname == "localhost" or ipaddress.ip_address(url.hostname).is_loopback
+        if url.scheme != "rerun+http" or not loopback or url.port is None or not 1 <= url.port <= 65535 or url.username is not None or url.password is not None or url.fragment or "#" in value or url.path != "/proxy" or any(character.isspace() or ord(character) < 32 for character in value):
+            raise ValueError("unsupported proxy address")
+    except (ValueError, TypeError) as error:
+        raise ViewError("Live target must be rerun+http://LOOPBACK:PORT/proxy, without credentials or fragments, with port 1–65535.") from error
+    return value
 
 
-def native_binary() -> Path:
+def resolve_target(target: str) -> tuple[str | None, str, bool]:
+    if not target or "\0" in target:
+        raise ViewError("Target must be nonempty and cannot contain NUL.")
+    if target.startswith("rerun+") or ("://" in target and target.split(":", 1)[0] in ("http", "https", "rerun")):
+        return None, live_url(target), True
+    if ":" in target and not target.startswith(("/", "./", "../")):
+        host, target = target.split(":", 1)
+        host_alias(host)
+        if "://" in target:
+            return host, live_url(target), True
+        if not target.startswith("/"):
+            raise ViewError("Remote recording paths must be absolute: SSH_ALIAS:/absolute/path/recording.rrd.")
+        if Path(target).suffix.lower() != ".rrd":
+            raise ViewError("Remote recording must be a .rrd file.")
+        return host, target, False
+    return None, str(selected_file(target)), False
+
+
+def native_binary(*, server: bool = False) -> Path:
+    remedy = SERVER_INSTALL if server else CLIENT_INSTALL
     try:
         installed = importlib.metadata.version("rerun-sdk")
         import rerun_cli
     except (ImportError, importlib.metadata.PackageNotFoundError) as error:
-        raise ViewError("Rerun is missing; explicitly install or update rerun-remote with uv tool install --force.") from error
+        raise ViewError(f"Rerun is missing; explicitly install or update with: {remedy}") from error
     if installed != VERSION:
-        raise ViewError(f"Installed Rerun SDK is {installed}; expected {VERSION}. Explicitly reinstall rerun-remote with uv tool install --force on this machine.")
+        raise ViewError(f"Installed Rerun SDK is {installed}; expected {VERSION}. Explicitly reinstall on this machine with: {remedy}")
     binary = Path(rerun_cli.__file__).with_name("rerun")
     if sys.platform == "darwin":
         bundled = binary.parent / "Rerun.app" / "Contents" / "MacOS" / "Rerun"
         if bundled.exists():
             binary = bundled
     if not binary.is_file() or not os.access(binary, os.X_OK):
-        raise ViewError(f"Bundled native Rerun executable is missing or not executable: {binary}. Explicitly reinstall rerun-remote with uv tool install --force.")
+        raise ViewError(f"Bundled native Rerun executable is missing or not executable: {binary}. Explicitly reinstall with: {remedy}")
     try:
         with tempfile.TemporaryDirectory(prefix="rerun-remote-version-") as root:
             result = subprocess.run([str(binary), "--version"], env=isolated_environment(Path(root)), capture_output=True, text=True, timeout=10, check=True)
     except (OSError, subprocess.SubprocessError) as error:
-        raise ViewError("Cannot run bundled native Rerun; explicitly reinstall rerun-remote on this machine.") from error
+        raise ViewError(f"Cannot run bundled native Rerun; explicitly reinstall with: {remedy}") from error
     if not re.search(rf"\brerun(?:-cli)?\s+{re.escape(VERSION)}(?:\s|$)", result.stdout):
-        raise ViewError(f"Bundled native Rerun version differs from {VERSION}; explicitly reinstall rerun-remote on this machine.")
+        raise ViewError(f"Bundled native Rerun version differs from {VERSION}; explicitly reinstall with: {remedy}")
     return binary
 
 
@@ -201,35 +179,40 @@ def recording_id(store_id: str) -> str:
     raise ViewError("Viewer returned an invalid recording identity.")
 
 
-def initialize_time(desktop: subprocess.Popen, port: int, requested: tuple[str, int], *, selected_segment: str | None = None, ssh: subprocess.Popen | None = None, timeout: float = 120) -> None:
-    command = [sys.executable, "-m", "rerun_remote", "_initialize", "--viewer-pid", str(desktop.pid), "--control-port", str(port), "--timeline=" + requested[0], "--nanoseconds=" + str(requested[1])]
+def initialize_time(desktop: subprocess.Popen, port: int, requested: tuple[str, int] | None, *, selected_segment: str | None = None, ssh: subprocess.Popen | None = None, timeout: float = 120, live: bool = False) -> None:
+    command = [sys.executable, "-m", "rerun_remote", "_initialize" if requested is not None else "_check-live", "--viewer-pid", str(desktop.pid), "--control-port", str(port)]
+    if requested is not None:
+        command += ["--timeline=" + requested[0], "--nanoseconds=" + str(requested[1])]
+        if live:
+            command += ["--live"]
     if selected_segment is not None:
         command += ["--segment-id=" + selected_segment]
+    operation = "live endpoint readiness" if live else "startup time initialization"
     helper = subprocess.Popen(command, stdout=subprocess.PIPE, start_new_session=True)
     try:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if desktop.poll() is not None:
-                raise ViewError(f"Native desktop viewer exited before startup time initialization (status {desktop.returncode}).")
+                raise ViewError(f"Native desktop viewer exited before {operation} (status {desktop.returncode}).")
             if ssh is not None and ssh.poll() is not None:
-                raise ViewError(f"SSH connection ended before startup time initialization (status {ssh.returncode}).")
+                raise ViewError(f"SSH connection ended before {operation} (status {ssh.returncode}).")
             status = helper.poll()
             if status is not None:
                 if status != 0 or helper.stdout.read(4096).strip() != b'{"initialized": true}':
-                    raise ViewError("Could not initialize startup time; check the preceding desktop control diagnostic.")
+                    raise ViewError(f"Could not complete {operation}; check the preceding desktop control diagnostic.")
                 return
             time.sleep(0.1)
-        raise ViewError("Desktop startup time initialization timed out before recording readiness or exact cursor readback.")
+        raise ViewError(f"Desktop {operation} timed out before recording readiness or exact cursor readback.")
     finally:
         stop_process(helper)
         helper.stdout.close()
 
 
-def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int], *, selected_segment: str | None = None, timeout: float = 120) -> None:
+def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int] | None, *, selected_segment: str | None = None, timeout: float = 120, live: bool = False) -> None:
     import numpy as np
     from rerun.experimental import ViewerClient
 
-    timeline_name, nanoseconds = requested
+    timeline_name, nanoseconds = requested if requested is not None else (None, None)
     deadline = time.monotonic() + timeout
     client = None
     selected_store = None
@@ -247,9 +230,11 @@ def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int], *
             continue
         if state.viewer_version != VERSION:
             raise ViewError(f"Desktop control endpoint reports Rerun {state.viewer_version}; expected {VERSION}. Explicitly update rerun-remote.")
-        if state.loading or not state.recordings:
+        if (state.loading and not live) or not state.recordings:
             time.sleep(0.1)
             continue
+        if requested is None:
+            return
         if len(state.recordings) != 1:
             raise ViewError("Startup time requires exactly the selected recording in the owned desktop viewer.")
         recording = state.recordings[0]
@@ -263,11 +248,17 @@ def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int], *
                 return
         else:
             timelines = [timeline for timeline in recording.timelines if timeline.name == timeline_name]
+            if live and not timelines:
+                time.sleep(0.1)
+                continue
             if len(timelines) != 1:
                 raise ViewError(f"Requested timeline {timeline_name!r} is unavailable in the selected recording.")
             timeline = timelines[0]
             if timeline.time_type not in ("duration", "timestamp"):
                 raise ViewError(f"Timeline {timeline_name!r} is {timeline.time_type}; --time accepts duration or timestamp timelines in nanoseconds.")
+            if live and (timeline.start is None or timeline.end is None or nanoseconds > timeline.end):
+                time.sleep(0.1)
+                continue
             if timeline.start is None or timeline.end is None or not timeline.start <= nanoseconds <= timeline.end:
                 raise ViewError(f"Requested nanoseconds are outside the recorded range of timeline {timeline_name!r}.")
             if not viewer_listener_owned(viewer_pid, port):
@@ -280,7 +271,7 @@ def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int], *
             selected_store = recording.store_id
             applied = True
         time.sleep(0.1)
-    raise ViewError("Desktop startup time initialization timed out before recording readiness or exact cursor readback.")
+    raise ViewError("Desktop live endpoint readiness timed out waiting for stream data or requested nanoseconds." if live else "Desktop startup time initialization timed out before recording readiness or exact cursor readback.")
 
 
 def local_view(binary: Path, recording: str, requested: tuple[str, int] | None = None) -> int:
@@ -294,16 +285,23 @@ def local_view(binary: Path, recording: str, requested: tuple[str, int] | None =
         stop_process(process)
 
 
-def remote_command(host: str, recording: str, config: dict) -> list[str]:
+def ssh_command(host: str, local_port: int, remote_port: int, remote_host: str = "127.0.0.1") -> list[str]:
     host_alias(host)
-    executable = config["hosts"].get(host, {}).get("executable", "rerun-remote")
-    argv = [executable, "_serve", "--recording", recording]
-    for key, value in config["resources"].items():
+    destination = f"[{remote_host}]" if ":" in remote_host else remote_host
+    # A shared master would own the forward outside this process's cleanup group.
+    return ["ssh", "-S", "none", "-T", "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-L", f"127.0.0.1:{local_port}:{destination}:{remote_port}", host]
+
+
+def remote_command(host: str, recording: str, resources: dict, port: int = PORT) -> list[str]:
+    argv = ["_serve", "--recording", recording, "--port", str(port)]
+    for key, value in resources.items():
         argv += ["--" + key.replace("_", "-"), str(value)]
-    return ["ssh", "-T", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-L", f"127.0.0.1:{PORT}:127.0.0.1:{PORT}", host, shlex.join(argv)]
+    missing = f"rerun-remote: remote executable missing; install explicitly with: {SERVER_INSTALL}; custom executable directories must be on the noninteractive SSH PATH."
+    resolver = 'executable=$(command -v rerun-remote) || executable="$HOME/.local/bin/rerun-remote"; if [ ! -x "$executable" ]; then printf "%s\\n" ' + shlex.quote(missing) + ' >&2; exit 127; fi; exec "$executable" '
+    return ssh_command(host, port, port) + [resolver + shlex.join(argv)]
 
 
-def readiness(process: subprocess.Popen, timeout: float = 200) -> tuple[str, str | None]:
+def readiness(process: subprocess.Popen, timeout: float = 200, *, port: int = PORT) -> tuple[str, str | None]:
     deadline = time.monotonic() + timeout
     data = bytearray()
     while time.monotonic() < deadline:
@@ -321,13 +319,15 @@ def readiness(process: subprocess.Popen, timeout: float = 200) -> tuple[str, str
                     response = json.loads(data.split(b"\n", 1)[0])
                     if response["version"] != VERSION:
                         raise ViewError(f"Remote Rerun version must be {VERSION}; explicitly update rerun-remote on both machines.")
+                    if not isinstance(response["segment_url"], str):
+                        raise ValueError("invalid segment address")
                     url = urlsplit(response["segment_url"])
-                    if url.scheme != "rerun+http" or url.hostname != "127.0.0.1" or url.port != PORT or url.username or url.password or not url.path:
+                    if url.scheme != "rerun+http" or url.hostname != "127.0.0.1" or url.port != port or url.username is not None or url.password is not None or url.fragment or not url.path:
                         raise ValueError("unexpected segment address")
                     segment_id = response.get("segment_id")
                     if segment_id is not None and (not isinstance(segment_id, str) or not segment_id):
                         raise ValueError("invalid segment identity")
-                    return urlunsplit((url.scheme, f"127.0.0.1:{PORT}", url.path, url.query, url.fragment)), segment_id
+                    return urlunsplit((url.scheme, f"127.0.0.1:{port}", url.path, url.query, "")), segment_id
                 except (ValueError, KeyError, TypeError) as error:
                     raise ViewError("Remote startup returned an invalid readiness response.") from error
     raise ViewError("Remote startup timed out; check SSH authentication, systemd user availability and the selected recording.")
@@ -347,18 +347,18 @@ def retire_ssh(process: subprocess.Popen) -> None:
         stop_process(process)
 
 
-def remote_view(binary: Path, host: str, recording: str, config: dict, requested: tuple[str, int] | None = None) -> int:
-    port_available()
-    ssh = subprocess.Popen(remote_command(host, recording, config), stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
+def remote_view(binary: Path, host: str, recording: str, resources: dict, requested: tuple[str, int] | None = None, *, port: int = PORT) -> int:
+    port_available(port)
+    ssh = subprocess.Popen(remote_command(host, recording, resources, port), stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
     desktop = None
     try:
-        segment_url, segment_id = readiness(ssh)
-        port = control_port() if requested is not None else None
+        segment_url, segment_id = readiness(ssh, port=port)
+        control = control_port() if requested is not None else None
         if requested is not None and segment_id is None:
             raise ViewError("Remote startup did not identify the selected recording; explicitly update rerun-remote on the execution host.")
-        desktop = viewer(binary, segment_url, config["resources"]["cpu_count"], control_port=port) if requested is not None else viewer(binary, segment_url, config["resources"]["cpu_count"])
+        desktop = viewer(binary, segment_url, resources["cpu_count"], control_port=control) if requested is not None else viewer(binary, segment_url, resources["cpu_count"])
         if requested is not None:
-            initialize_time(desktop, port, requested, selected_segment=segment_id, ssh=ssh)
+            initialize_time(desktop, control, requested, selected_segment=segment_id, ssh=ssh)
         while desktop.poll() is None:
             if ssh.poll() is not None:
                 raise ViewError(f"SSH connection ended (status {ssh.returncode}); the desktop session has been retired.")
@@ -370,6 +370,42 @@ def remote_view(binary: Path, host: str, recording: str, config: dict, requested
         if desktop is not None:
             stop_process(desktop)
         retire_ssh(ssh)
+        ssh.stdout.close()
+
+
+def live_view(binary: Path, target: str, *, host: str | None = None, port: int = PORT, requested: tuple[str, int] | None = None) -> int:
+    ssh = None
+    desktop = None
+    try:
+        if host is not None:
+            port_available(port)
+            url = urlsplit(target)
+            command = ssh_command(host, port, url.port, url.hostname)
+            command.insert(1, "-N")
+            ssh = subprocess.Popen(command, stdin=subprocess.DEVNULL, start_new_session=True)
+            deadline = time.monotonic() + 20
+            while not viewer_listener_owned(ssh.pid, port):
+                if ssh.poll() is not None:
+                    raise ViewError(f"SSH tunnel failed (status {ssh.returncode}); check the preceding SSH diagnostic.")
+                if time.monotonic() >= deadline:
+                    raise ViewError("SSH tunnel did not establish its owned loopback listener within 20 seconds.")
+                time.sleep(0.1)
+            target = urlunsplit((url.scheme, f"127.0.0.1:{port}", url.path, url.query, ""))
+        control = control_port()
+        desktop = viewer(binary, target, control_port=control)
+        initialize_time(desktop, control, requested, ssh=ssh, live=True)
+        while desktop.poll() is None:
+            if ssh is not None and ssh.poll() is not None:
+                raise ViewError(f"SSH connection ended (status {ssh.returncode}); the desktop session has been retired.")
+            time.sleep(0.2)
+        if desktop.returncode:
+            raise ViewError(f"Native desktop viewer exited with status {desktop.returncode}.")
+        return 0
+    finally:
+        if desktop is not None:
+            stop_process(desktop)
+        if ssh is not None:
+            stop_process(ssh)
 
 
 def listener_owned(pid: int, port: int = PORT) -> bool:
@@ -461,16 +497,16 @@ def serve_worker(args: argparse.Namespace) -> int:
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, terminate)
     resources = {key: getattr(args, key) for key in DEFAULT_RESOURCES}
-    binary = native_binary()
+    binary = native_binary(server=True)
     selected = selected_file(args.recording)
     try:
         if importlib.metadata.version("datafusion") != "54.0.0":
-            raise ViewError("Remote catalog requires datafusion==54.0.0; explicitly install or update rerun-remote[server].")
+            raise ViewError(f"Remote catalog requires datafusion==54.0.0; explicitly install or update with: {SERVER_INSTALL}")
         from rerun.catalog import CatalogClient
     except (ImportError, importlib.metadata.PackageNotFoundError) as error:
-        raise ViewError("Remote catalog dependencies are missing; explicitly install or update rerun-remote[server].") from error
+        raise ViewError(f"Remote catalog dependencies are missing; explicitly install or update with: {SERVER_INSTALL}") from error
     verify_controls(args.unit, resources, os.getpid())
-    port_available()
+    port_available(args.port)
     disconnected = threading.Event()
     stop_watcher = threading.Event()
     children = []
@@ -496,7 +532,7 @@ def serve_worker(args: argparse.Namespace) -> int:
         with child_lock:
             if disconnected.is_set():
                 raise ViewError("SSH connection closed before startup.")
-            server = subprocess.Popen([str(binary), "--threads", str(resources["cpu_count"]), "server", "--host", "127.0.0.1", "--port", str(PORT)], env=environment, stdin=subprocess.DEVNULL, stdout=diagnostics, stderr=diagnostics, start_new_session=True)
+            server = subprocess.Popen([str(binary), "--threads", str(resources["cpu_count"]), "server", "--host", "127.0.0.1", "--port", str(args.port)], env=environment, stdin=subprocess.DEVNULL, stdout=diagnostics, stderr=diagnostics, start_new_session=True)
             children.append(server)
         try:
             watcher.start()
@@ -507,10 +543,10 @@ def serve_worker(args: argparse.Namespace) -> int:
                     raise ViewError("SSH connection closed during startup.")
                 if server.poll() is not None:
                     raise ViewError(f"Native remote server exited before readiness (status {server.returncode}).")
-                if listener_owned(server.pid):
+                if listener_owned(server.pid, args.port):
                     verify_controls(args.unit, resources, server.pid)
                     try:
-                        client = CatalogClient(f"rerun+http://127.0.0.1:{PORT}")
+                        client = CatalogClient(f"rerun+http://127.0.0.1:{args.port}")
                         client.entries()
                         break
                     except Exception:
@@ -518,7 +554,7 @@ def serve_worker(args: argparse.Namespace) -> int:
                 time.sleep(0.2)
             if client is None:
                 raise ViewError("Native remote server did not become ready within 60 seconds.")
-            if not listener_owned(server.pid):
+            if not listener_owned(server.pid, args.port):
                 raise ViewError("Remote loopback listener is not owned by this server; existing catalog preserved.")
             segment_url, segment_id = catalog_recording(client, selected, disconnected)
             if disconnected.is_set() or server.poll() is not None:
@@ -528,6 +564,14 @@ def serve_worker(args: argparse.Namespace) -> int:
                 if server.poll() is not None:
                     raise ViewError(f"Native remote server exited (status {server.returncode}).")
             return 0
+        except Exception as error:
+            diagnostics.seek(0, os.SEEK_END)
+            size = diagnostics.tell()
+            diagnostics.seek(max(0, size - 4096))
+            excerpt = diagnostics.read(4096).decode("utf-8", errors="replace").strip()
+            if excerpt:
+                raise ViewError(f"{error}\nNative server diagnostic (last 4096 bytes):\n{excerpt}") from error
+            raise
         finally:
             stop_watcher.set()
             with child_lock:
@@ -546,7 +590,7 @@ def serve(args: argparse.Namespace) -> int:
     if len(cpus) != resources["cpu_count"]:
         raise ViewError("Requested CPU count exceeds the execution host's effective CPU affinity.")
     unit = f"rerun-remote-{uuid.uuid4().hex}.scope"
-    command = ["systemd-run", "--user", "--scope", "--quiet", "--unit=" + unit, f"--property=MemoryMax={resources['memory_bytes']}", f"--property=TasksMax={resources['tasks_max']}", f"--property=RuntimeMaxSec={resources['runtime_seconds']}s", "taskset", "-c", ",".join(map(str, cpus)), sys.executable, "-m", "rerun_remote", "_worker", "--unit", unit, "--recording", str(selected)]
+    command = ["systemd-run", "--user", "--scope", "--quiet", "--unit=" + unit, f"--property=MemoryMax={resources['memory_bytes']}", f"--property=TasksMax={resources['tasks_max']}", f"--property=RuntimeMaxSec={resources['runtime_seconds']}s", "taskset", "-c", ",".join(map(str, cpus)), sys.executable, "-m", "rerun_remote", "_worker", "--unit", unit, "--recording", str(selected), "--port", str(args.port)]
     for key, value in resources.items():
         command += ["--" + key.replace("_", "-"), str(value)]
     try:
@@ -559,35 +603,51 @@ def serve(args: argparse.Namespace) -> int:
         stop_process(process)
 
 
-def parser() -> argparse.ArgumentParser:
+def positive_integer(value: str) -> int:
+    if not re.fullmatch(r"[0-9]+", value) or int(value) < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return int(value)
+
+
+def port_number(value: str) -> int:
+    port = positive_integer(value)
+    if port > 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def parser(command: str | None = None) -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("--config", type=Path, default=None, help="User TOML configuration (default: ~/.config/rerun-remote/config.toml)")
-    commands = result.add_subparsers(dest="command", required=True, metavar="{view}")
-    view = commands.add_parser("view", help="Open a local or SSH-hosted recording")
-    view.add_argument("recording")
-    view.add_argument("--host", help="Existing SSH alias; relative paths use its configured recording_dir")
-    view.add_argument("--time", type=startup_time, help="Pause at TIMELINE=INTEGER_NS after the selected recording loads")
-    view.add_argument("--config", type=Path, default=None, dest="view_config", help="User TOML configuration")
-    for name in ("_serve", "_worker"):
-        internal = commands.add_parser(name)
-        internal.add_argument("--recording", required=True)
-        if name == "_worker":
-            internal.add_argument("--unit", required=True)
+    if command in ("_serve", "_worker"):
+        result.add_argument("--recording", required=True)
+        result.add_argument("--port", type=port_number, default=PORT)
+        if command == "_worker":
+            result.add_argument("--unit", required=True)
         for key, value in DEFAULT_RESOURCES.items():
-            internal.add_argument("--" + key.replace("_", "-"), type=int, default=value)
-    initialize = commands.add_parser("_initialize")
-    initialize.add_argument("--viewer-pid", type=int, required=True)
-    initialize.add_argument("--control-port", type=int, required=True)
-    initialize.add_argument("--timeline", required=True)
-    initialize.add_argument("--nanoseconds", type=int, required=True)
-    initialize.add_argument("--segment-id")
+            result.add_argument("--" + key.replace("_", "-"), type=positive_integer, default=value)
+    elif command in ("_initialize", "_check-live"):
+        result.add_argument("--viewer-pid", type=int, required=True)
+        result.add_argument("--control-port", type=port_number, required=True)
+        if command == "_initialize":
+            result.add_argument("--timeline", required=True)
+            result.add_argument("--nanoseconds", type=int, required=True)
+            result.add_argument("--segment-id")
+            result.add_argument("--live", action="store_true")
+    else:
+        result.add_argument("target", help="Local .rrd, SSH_ALIAS:/absolute/file.rrd, or [SSH_ALIAS:]rerun+http://LOOPBACK:PORT/proxy")
+        result.add_argument("--time", type=startup_time, help="Pause once at TIMELINE=INTEGER_NS after the recording loads")
+        result.add_argument("--port", type=port_number, default=None, help=f"Local SSH forwarding port; also the remote file server port (default {PORT})")
+        for key in DEFAULT_RESOURCES:
+            result.add_argument("--" + key.replace("_", "-"), type=positive_integer, default=None, help="Remote file server resource limit")
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    command = arguments.pop(0) if arguments and arguments[0] in ("_serve", "_worker", "_initialize", "_check-live") else None
+    args = parser(command).parse_args(arguments)
     previous_handlers = {}
-    if args.command == "view":
+    if command is None:
         def interrupt(signum, frame):
             raise KeyboardInterrupt
         for name in ("SIGTERM", "SIGHUP"):
@@ -595,31 +655,40 @@ def main(argv: list[str] | None = None) -> int:
                 signum = getattr(signal, name)
                 previous_handlers[signum] = signal.signal(signum, interrupt)
     try:
-        if args.command == "_initialize":
+        if command == "_initialize":
             requested = startup_time(f"{args.timeline}={args.nanoseconds}")
-            apply_startup_time(args.viewer_pid, args.control_port, requested, selected_segment=args.segment_id)
+            apply_startup_time(args.viewer_pid, args.control_port, requested, selected_segment=args.segment_id, live=args.live)
             print(json.dumps({"initialized": True}), flush=True)
             return 0
-        if args.command == "_serve":
+        if command == "_check-live":
+            apply_startup_time(args.viewer_pid, args.control_port, None, live=True)
+            print(json.dumps({"initialized": True}), flush=True)
+            return 0
+        if command == "_serve":
             return serve(args)
-        if args.command == "_worker":
+        if command == "_worker":
             return serve_worker(args)
-        path = args.view_config or args.config or DEFAULT_CONFIG
-        config = load_config(path, bool(args.view_config or args.config))
-        host, recording = resolve_target(args.recording, args.host, config)
+        host, target, live = resolve_target(args.target)
+        if host is None and args.port is not None:
+            raise ViewError("--port applies only to SSH targets.")
+        if (host is None or live) and any(getattr(args, key) is not None for key in DEFAULT_RESOURCES):
+            raise ViewError("Resource options apply only to remote files.")
         binary = native_binary()
+        if live:
+            return live_view(binary, target, host=host, port=args.port or PORT, requested=args.time)
         if host is None:
-            return local_view(binary, recording, args.time) if args.time is not None else local_view(binary, recording)
-        return remote_view(binary, host, recording, config, args.time) if args.time is not None else remote_view(binary, host, recording, config)
+            return local_view(binary, target, args.time) if args.time is not None else local_view(binary, target)
+        resources = {key: getattr(args, key) or value for key, value in DEFAULT_RESOURCES.items()}
+        return remote_view(binary, host, target, resources, args.time, port=args.port or PORT)
     except KeyboardInterrupt:
         return 130
     except (ViewError, OSError) as error:
         print(f"rerun-remote: {error}", file=sys.stderr)
         return 1
     except Exception as error:
-        if args.command in ("_serve", "_worker", "_initialize"):
-            operation = "Desktop startup time initialization" if args.command == "_initialize" else "Remote startup"
-            print(f"rerun-remote: {operation} failed ({type(error).__name__}); check the selected recording and the installed Rerun profile.", file=sys.stderr)
+        if command is not None:
+            operation = "Desktop startup initialization" if command in ("_initialize", "_check-live") else "Remote startup"
+            print(f"rerun-remote: {operation} failed ({type(error).__name__}: {str(error)[:1000]}); check the selected recording and the installed Rerun profile.", file=sys.stderr)
             return 1
         raise
     finally:

@@ -1,1 +1,1 @@
-"""Native desktop viewing of local and SSH-hosted RRD recordings."""
+"""Native desktop viewing of local and SSH-hosted recordings and live streams."""
