@@ -7,10 +7,10 @@ Open saved recordings and live Rerun streams in the native desktop viewer. Remot
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run on your laptop:
 
 ```sh
-uv tool install --python 3.12 'rerun-remote @ git+ssh://git@github.com/genzorr/rerun-remote.git'
+uv tool install --python 3.12 'rerun-remote @ git+https://github.com/genzorr/rerun-remote.git@main'
 ```
 
-Your laptop needs Git and access to this private repository through GitHub SSH. Ensure uv's executable directory is on your local PATH. No separate rerun-remote installation or GitHub credentials are needed on the recording server.
+Your laptop needs Git. Installation uses HTTPS and requires no GitHub account or SSH key. Ensure uv's executable directory is on your local PATH. Remote viewing uses your existing SSH aliases and authentication; no separate rerun-remote installation or GitHub credentials are needed on the recording server.
 
 To update, repeat the install command with `--reinstall --upgrade`.
 

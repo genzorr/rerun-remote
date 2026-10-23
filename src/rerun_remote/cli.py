@@ -24,7 +24,7 @@ import uuid
 VERSION = "0.40.0"
 PORT = 38886
 DEFAULT_RESOURCES = {"memory_bytes": 4 * 1024**3, "tasks_max": 128, "runtime_seconds": 7200, "cpu_count": 2}
-CLIENT_INSTALL = "uv tool install --python 3.12 --reinstall --upgrade 'rerun-remote @ git+ssh://git@github.com/genzorr/rerun-remote.git'"
+CLIENT_INSTALL = "uv tool install --python 3.12 --reinstall --upgrade 'rerun-remote @ git+https://github.com/genzorr/rerun-remote.git@main'"
 SERVER_REPAIR = "Remote runtime is invalid; retry using a fresh isolated XDG_CACHE_HOME, or explicitly update the laptop client."
 ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
