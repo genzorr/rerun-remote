@@ -21,7 +21,7 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
-VERSION = "0.40.0"
+VERSION = "0.41.0"
 PORT = 38886
 DEFAULT_RESOURCES = {"memory_bytes": 4 * 1024**3, "tasks_max": 128, "runtime_seconds": 7200, "cpu_count": 2}
 CLIENT_INSTALL = "uv tool install --python 3.12 --reinstall --upgrade 'rerun-remote @ git+https://github.com/genzorr/rerun-remote.git@main'"
@@ -224,7 +224,7 @@ def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int] | 
         try:
             if client is None:
                 client = ViewerClient.connect(f"rerun+http://127.0.0.1:{port}/proxy")
-            state = client.viewer_state()
+            state = client.get_state()
         except Exception:
             time.sleep(0.1)
             continue
@@ -265,7 +265,7 @@ def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int] | 
                 raise ViewError("Desktop control listener ownership changed; startup time was not applied.")
             value = np.timedelta64(nanoseconds, "ns") if timeline.time_type == "duration" else np.datetime64(nanoseconds, "ns")
             try:
-                client.set_time(timeline_name, **{timeline.time_type: value}, play=False, recording=recording.store_id)
+                client.set_time(timeline_name, **{timeline.time_type: value}, play_state="paused", recording=recording.store_id)
             except Exception as error:
                 raise ViewError("Could not initialize the selected recording's startup time.") from error
             selected_store = recording.store_id

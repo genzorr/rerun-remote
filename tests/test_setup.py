@@ -144,14 +144,14 @@ class RuntimeFixture(unittest.TestCase):
         self.failure = self.directory / "fail-install"
         self.bad_version = self.directory / "bad-version"
         native = self.directory / "rerun"
-        native.write_text("#!/bin/sh\nprintf 'rerun 0.40.0\\n'\n")
+        native.write_text("#!/bin/sh\nprintf 'rerun 0.41.0\\n'\n")
         native.chmod(0o700)
         wrapper = "\n".join((
             "#!" + sys.executable,
             "import importlib.metadata,sys,types",
             "from pathlib import Path",
             "sys.version_info=(3,12,0)",
-            "importlib.metadata.version=lambda name: ('0.1' if Path(" + repr(str(self.bad_version)) + ").exists() else {'rerun-sdk':'0.40.0','datafusion':'54.0.0'}[name])",
+            "importlib.metadata.version=lambda name: ('0.1' if Path(" + repr(str(self.bad_version)) + ").exists() else {'rerun-sdk':'0.41.0','datafusion':'54.0.0'}[name])",
             "sys.modules['rerun_cli']=types.SimpleNamespace(__file__=" + repr(str(self.directory / "__init__.py")) + ")",
             "exec(sys.argv[2])",
         )) + "\n"

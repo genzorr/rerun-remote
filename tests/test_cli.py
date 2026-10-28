@@ -270,7 +270,7 @@ class TestVersion(unittest.TestCase):
 
     def test_sdk_mismatch_requires_explicit_update(self):
         with patch.object(cli.importlib.metadata, "version", return_value="0.32.0"), patch.dict(sys.modules, {"rerun_cli": types.SimpleNamespace(__file__="/fake/__init__.py")}):
-            with self.assertRaisesRegex(cli.ViewError, "expected 0.40.0"):
+            with self.assertRaisesRegex(cli.ViewError, "expected 0.41.0"):
                 cli.native_binary()
 
     def test_native_mismatch_requires_explicit_update(self):
@@ -466,7 +466,7 @@ class TestProcesses(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             marker = Path(root) / "eof"
             ready = json.dumps({"version": cli.VERSION, "segment_url": f"rerun+http://127.0.0.1:{cli.PORT}/catalog/selected/segment"})
-            ssh = self.spawn("import sys,pathlib; print(" + repr(ready) + ",flush=True); sys.stdin.read(); pathlib.Path(" + repr(str(marker)) + ").touch()", stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            ssh = self.spawn("import sys,pathlib; print(" + repr(ready) + ",flush=True); sys.stdin.buffer.read(); pathlib.Path(" + repr(str(marker)) + ").touch()", stdin=subprocess.PIPE, stdout=subprocess.PIPE)
             desktop = self.spawn("pass")
             resources = cli.DEFAULT_RESOURCES
             with patch.object(cli, "port_available"), patch.object(cli.subprocess, "Popen", return_value=ssh), patch.object(cli, "viewer", return_value=desktop):
@@ -643,9 +643,9 @@ class TestStartupTime(unittest.TestCase):
             with self.subTest(kind=kind):
                 state = self.state(time_type=kind, store=r"Recording:catalog\:name\\part:selected:opaque")
                 self.client.reset_mock()
-                self.client.viewer_state.side_effect = [self.state(loading=True), state, state]
-                def set_time(timeline, *, play, recording, **time):
-                    self.assertFalse(play)
+                self.client.get_state.side_effect = [self.state(loading=True), state, state]
+                def set_time(timeline, *, play_state, recording, **time):
+                    self.assertEqual(play_state, "paused")
                     self.assertEqual(recording, state.recordings[0].store_id)
                     self.assertEqual(timeline, "arrival")
                     value = time[kind]
@@ -659,12 +659,12 @@ class TestStartupTime(unittest.TestCase):
                 self.client.set_time.assert_called_once()
 
     def test_wrong_recording_and_invalid_timeline_never_seek(self):
-        cases = ((self.state(store="Recording:application:foreign"), "different recording", {"selected_segment": "selected"}), (self.state(timeline="other"), "unavailable", {}), (self.state(time_type="sequence"), "duration or timestamp", {}), (self.state(start=0, end=10), "outside", {}), (self.state(start=None), "outside", {}), (self.state(version="0.38.0"), "expected 0.40.0", {}))
+        cases = ((self.state(store="Recording:application:foreign"), "different recording", {"selected_segment": "selected"}), (self.state(timeline="other"), "unavailable", {}), (self.state(time_type="sequence"), "duration or timestamp", {}), (self.state(start=0, end=10), "outside", {}), (self.state(start=None), "outside", {}), (self.state(version="0.38.0"), "expected 0.41.0", {}))
         for state, diagnostic, kwargs in cases:
             with self.subTest(diagnostic=diagnostic):
                 self.client.reset_mock()
-                self.client.viewer_state.side_effect = None
-                self.client.viewer_state.return_value = state
+                self.client.get_state.side_effect = None
+                self.client.get_state.return_value = state
                 with self.assertRaisesRegex(cli.ViewError, diagnostic):
                     self.initialize(("arrival", 11), **kwargs)
                 self.client.set_time.assert_not_called()
@@ -672,13 +672,13 @@ class TestStartupTime(unittest.TestCase):
     def test_ambiguous_local_recordings_never_seek(self):
         state = self.state()
         state.recordings.append(self.state(store="Recording:application:second").recordings[0])
-        self.client.viewer_state.return_value = state
+        self.client.get_state.return_value = state
         with self.assertRaisesRegex(cli.ViewError, "exactly the selected recording"):
             self.initialize(("arrival", 10))
         self.client.set_time.assert_not_called()
 
     def test_exact_cursor_readback_is_required_without_repeating_seek(self):
-        self.client.viewer_state.return_value = self.state(cursor=9)
+        self.client.get_state.return_value = self.state(cursor=9)
         with self.assertRaisesRegex(cli.ViewError, "exact cursor readback"):
             self.initialize(("arrival", 10), timeout=0.25)
         self.client.set_time.assert_called_once()
@@ -687,34 +687,34 @@ class TestStartupTime(unittest.TestCase):
         state = self.state(loading=True)
         empty = self.state(loading=True)
         empty.recordings = []
-        self.client.viewer_state.side_effect = [empty, state]
+        self.client.get_state.side_effect = [empty, state]
         self.initialize(None, live=True)
         self.client.set_time.assert_not_called()
 
     def test_live_readiness_accepts_multiple_recordings_without_time(self):
         state = self.state(loading=True)
         state.recordings.append(self.state(store="Recording:application:second").recordings[0])
-        self.client.viewer_state.return_value = state
+        self.client.get_state.return_value = state
         self.initialize(None, live=True)
         self.client.set_time.assert_not_called()
 
     def test_live_time_waits_for_future_data_then_seeks_once(self):
         waiting = self.state(loading=True, end=9)
         ready = self.state(loading=True, end=12, cursor=10)
-        self.client.viewer_state.side_effect = [waiting, ready, ready]
+        self.client.get_state.side_effect = [waiting, ready, ready]
         self.initialize(("arrival", 10), live=True)
         self.client.set_time.assert_called_once()
 
     def test_unavailable_live_endpoint_is_bounded_without_seeking(self):
         state = self.state(loading=True)
         state.recordings = []
-        self.client.viewer_state.return_value = state
+        self.client.get_state.return_value = state
         with self.assertRaisesRegex(cli.ViewError, "live endpoint readiness timed out"):
             self.initialize(None, live=True, timeout=.15)
         self.client.set_time.assert_not_called()
 
     def test_loading_timeout_never_seeks(self):
-        self.client.viewer_state.return_value = self.state(loading=True)
+        self.client.get_state.return_value = self.state(loading=True)
         with self.assertRaisesRegex(cli.ViewError, "timed out"):
             self.initialize(("arrival", 10), timeout=0.15)
         self.client.set_time.assert_not_called()
@@ -786,7 +786,7 @@ class TestStartupTime(unittest.TestCase):
             self.assertTrue(select_ready(desktop.stdout))
             desktop.stdout.readline()
             state = self.state(cursor=10)
-            self.client.viewer_state.return_value = state
+            self.client.get_state.return_value = state
             with patch.dict(sys.modules, {"rerun.experimental": self.module}):
                 cli.apply_startup_time(desktop.pid, port, ("arrival", 10), timeout=1)
             self.client.set_time.assert_called_once()
@@ -805,7 +805,7 @@ class TestStartupTime(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             marker = Path(root) / "ssh-eof"
             ready = json.dumps({"version": cli.VERSION, "segment_url": f"rerun+http://127.0.0.1:{cli.PORT}/catalog/selected/segment", "segment_id": "selected"})
-            source = "import sys,pathlib; print(" + repr(ready) + ",flush=True); sys.stdin.read(); pathlib.Path(" + repr(str(marker)) + ").touch()"
+            source = "import sys,pathlib; print(" + repr(ready) + ",flush=True); sys.stdin.buffer.read(); pathlib.Path(" + repr(str(marker)) + ").touch()"
             ssh = subprocess.Popen([sys.executable, "-c", source], stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
             desktop = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
             try:
@@ -837,12 +837,12 @@ class TestStartupTime(unittest.TestCase):
                 "class ViewerClient:",
                 "    @classmethod",
                 "    def connect(cls,url): return cls()",
-                "    def viewer_state(self):",
+                "    def get_state(self):",
                 "        state=json.loads(FILE.read_text())",
                 "        recording=S(store_id='Recording:application:selected',timelines=[S(name='-arrival',time_type='timestamp',start=0,end=2**63-1)],current_timeline='-arrival',current_time=state['cursor'])",
-                "        return S(viewer_version='0.40.0',loading=[],recordings=[recording])",
-                "    def set_time(self,timeline,*,timestamp,play,recording):",
-                "        assert timeline=='-arrival' and recording=='Recording:application:selected' and play is False",
+                "        return S(viewer_version='0.41.0',loading=[],recordings=[recording])",
+                "    def set_time(self,timeline,*,timestamp,play_state,recording):",
+                "        assert timeline=='-arrival' and recording=='Recording:application:selected' and play_state=='paused'",
                 "        assert str(timestamp.dtype)=='datetime64[ns]'",
                 "        state=json.loads(FILE.read_text()); state['cursor']=int(timestamp.astype('int64')); state['seeks']+=1; FILE.write_text(json.dumps(state))",
             )) + "\n")
