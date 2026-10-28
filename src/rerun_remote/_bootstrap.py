@@ -23,7 +23,7 @@ import zipfile
 
 SCHEMA = 1
 PYTHON = "3.12"
-REQUIREMENTS = ["rerun-sdk==0.40.0", "datafusion==54.0.0"]
+REQUIREMENTS = ["rerun-sdk==0.41.0", "datafusion==54.0.0"]
 MAX_PAYLOAD = 2 * 1024 * 1024
 MAX_HEADER = 4096
 SETUP_SECONDS = 900
@@ -274,7 +274,7 @@ def runtime_environment(profile: Path) -> dict:
 
 
 def validate_runtime(profile: Path, lifecycle: Lifecycle) -> None:
-    code = "import sys,importlib.metadata as m; assert sys.version_info[:2]==(3,12), 'Python 3.12 required'; assert m.version('rerun-sdk')=='0.40.0', 'SDK version mismatch'; assert m.version('datafusion')=='54.0.0', 'DataFusion version mismatch'; from rerun_remote.cli import native_binary; native_binary(server=True)"
+    code = "import sys,importlib.metadata as m; assert sys.version_info[:2]==(3,12), 'Python 3.12 required'; assert m.version('rerun-sdk')=='0.41.0', 'SDK version mismatch'; assert m.version('datafusion')=='54.0.0', 'DataFusion version mismatch'; from rerun_remote.cli import native_binary; native_binary(server=True)"
     lifecycle.run([str(profile / "env/bin/python"), "-c", code], env=runtime_environment(profile))
 
 

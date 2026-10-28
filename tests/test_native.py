@@ -143,7 +143,7 @@ class TestNative(unittest.TestCase):
                                 continue
                             try:
                                 client = self.ViewerClient.connect(f"rerun+http://127.0.0.1:{connection.laddr.port}/proxy")
-                                state = client.viewer_state()
+                                state = client.get_state()
                                 if state.recordings and state.recordings[0].timelines:
                                     return child, client
                             except Exception:
@@ -201,7 +201,7 @@ class TestNative(unittest.TestCase):
 
     def assert_advancing(self, client) -> None:
         def end():
-            state = client.viewer_state()
+            state = client.get_state()
             recording = state.recordings[0]
             self.assertIn("11111111-2222-4333-8444-555555555555", recording.store_id)
             return next(timeline.end for timeline in recording.timelines if timeline.name == "elapsed")
@@ -216,7 +216,7 @@ class TestNative(unittest.TestCase):
     def assert_saved_state(self, client, name: str) -> None:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            state = client.viewer_state()
+            state = client.get_state()
             if state.recordings[0].current_time == 1_234_567_890:
                 break
             time.sleep(0.2)
@@ -224,7 +224,7 @@ class TestNative(unittest.TestCase):
         self.assertEqual(state.recordings[0].current_time, 1_234_567_890)
         self.assertIn("Saved samples", [view.name for view in state.views])
         time.sleep(0.5)
-        self.assertEqual(client.viewer_state().recordings[0].current_time, 1_234_567_890, "Startup cursor must remain paused")
+        self.assertEqual(client.get_state().recordings[0].current_time, 1_234_567_890, "Startup cursor must remain paused")
         artifacts = Path(os.environ.get("RERUN_REMOTE_NATIVE_ARTIFACTS", str(self.root)))
         artifacts.mkdir(parents=True, exist_ok=True)
         client.save_screenshot(str(artifacts / f"{name}.png"))
@@ -241,7 +241,7 @@ class TestNative(unittest.TestCase):
         self.save_recording(path, blueprint=False)
         process = self.cli(str(path))
         _, client = self.viewer(process)
-        self.assertIn("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", client.viewer_state().recordings[0].store_id)
+        self.assertIn("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", client.get_state().recordings[0].store_id)
 
     def test_live_producer_survives_viewer_exit_and_interrupt(self) -> None:
         self.live_attachment(remote=False)
@@ -306,14 +306,14 @@ class TestNative(unittest.TestCase):
         response = process.stdout.readline()
         self.assertTrue(response, self.diagnostics())
         ready = json.loads(response)
-        self.assertEqual(ready["version"], "0.40.0")
+        self.assertEqual(ready["version"], "0.41.0")
         self.assertIn(f"127.0.0.1:{port}/", ready["segment_url"])
         import rerun_cli
         import numpy as np
         binary = Path(rerun_cli.__file__).with_name("rerun")
         desktop = self.start(["xvfb-run", "-a", "--server-args=-screen 0 1280x720x24 -nolisten tcp -ac -extension GLX", str(binary), "--bind", "127.0.0.1", "--port", "auto", ready["segment_url"]])
         _, client = self.viewer(desktop)
-        client.set_time("elapsed", duration=np.timedelta64(1_234_567_890, "ns"), play=False)
+        client.set_time("elapsed", duration=np.timedelta64(1_234_567_890, "ns"), play_state="paused")
         self.assert_saved_state(client, "ssh-server-blueprint")
         process.stdin.close()
         self.assertEqual(process.wait(timeout=25), 0, self.diagnostics())
@@ -423,7 +423,7 @@ class TestNative(unittest.TestCase):
         self.assertEqual(len(profiles), 2, "Different source with the same package version needs its own profile")
         for identity, modified in original.items():
             self.assertEqual(profiles[identity], modified, "A completed active profile must remain unchanged")
-        self.assertEqual(clients[0].viewer_state().recordings[0].current_time, 1_234_567_890)
+        self.assertEqual(clients[0].get_state().recordings[0].current_time, 1_234_567_890)
         for process in [*viewers, changed]:
             self.interrupt_cli(process)
             self.assertEqual(process.wait(timeout=25), 130, self.diagnostics())
