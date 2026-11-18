@@ -24,9 +24,12 @@ rerun-remote recording-server:/srv/recordings/recording.rrd
 # Existing live Rerun endpoints
 rerun-remote rerun+http://127.0.0.1:9876/proxy
 rerun-remote recording-server:rerun+http://127.0.0.1:9876/proxy
+rerun-remote --recording my-app my-session recording-server:rerun+http://127.0.0.1:9876/proxy
 ```
 
 Use an existing SSH alias and an absolute remote file path. Quote targets containing spaces. Live targets must be loopback Rerun HTTP proxy endpoints; start the compatible producer separately.
+
+On a shared live endpoint, pass `--recording APPLICATION_ID RECORDING_ID` to show only that recording and keep receiving its updates. Use the IDs reported by the producer or from the recording's details in an existing Viewer. Omit the option to see all available recordings. The selection happens on your laptop, so SSH still carries the shared stream. If matching data is unavailable, the command reports both requested IDs and exits.
 
 The first remote file opening prepares a matching server runtime in your account's cache. The package travels over SSH; the server downloads public dependencies and a private Python runtime as needed. Setup takes longer the first time and reports progress. Later openings reuse the cache; client updates get a separate matching environment. Existing installations and running sessions are preserved. Local files and live connections do not trigger remote setup.
 

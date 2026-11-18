@@ -9,7 +9,7 @@ description = "Open local and SSH-hosted RRD recordings and live streams in the 
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
-dependencies = ["rerun-sdk==0.41.0"]
+dependencies = ["rerun-sdk==0.41.0", "grpcio>=1.76,<2", "protobuf>=6.31,<8"]
 
 [project.optional-dependencies]
 server = ["datafusion==54.0.0"]
