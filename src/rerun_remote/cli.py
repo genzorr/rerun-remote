@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import importlib.metadata
 import ipaddress
 import json
@@ -153,8 +154,9 @@ def startup_time(value: str) -> tuple[str, int]:
     return match[1], nanoseconds
 
 
-def viewer(binary: Path, target: str, threads: int = 2, *, control_port: int | None = None) -> subprocess.Popen:
-    return subprocess.Popen([str(binary), "--bind", "127.0.0.1", "--port", str(control_port) if control_port is not None else "auto", "--threads", str(threads), target], start_new_session=True)
+def viewer(binary: Path, target: str | None, threads: int = 2, *, control_port: int | None = None) -> subprocess.Popen:
+    command = [str(binary), "--bind", "127.0.0.1", "--port", str(control_port) if control_port is not None else "auto", "--threads", str(threads)]
+    return subprocess.Popen(command if target is None else [*command, target], start_new_session=True)
 
 
 def control_port() -> int:
@@ -179,7 +181,7 @@ def recording_id(store_id: str) -> str:
     raise ViewError("Viewer returned an invalid recording identity.")
 
 
-def initialize_time(desktop: subprocess.Popen, port: int, requested: tuple[str, int] | None, *, selected_segment: str | None = None, ssh: subprocess.Popen | None = None, timeout: float = 120, live: bool = False) -> None:
+def initialize_time(desktop: subprocess.Popen, port: int, requested: tuple[str, int] | None, *, selected_segment: str | None = None, ssh: subprocess.Popen | None = None, timeout: float = 120, live: bool = False, selected_store: str | None = None, check_relay: Callable[[], None] | None = None) -> None:
     command = [sys.executable, "-m", "rerun_remote", "_initialize" if requested is not None else "_check-live", "--viewer-pid", str(desktop.pid), "--control-port", str(port)]
     if requested is not None:
         command += ["--timeline=" + requested[0], "--nanoseconds=" + str(requested[1])]
@@ -187,11 +189,15 @@ def initialize_time(desktop: subprocess.Popen, port: int, requested: tuple[str, 
             command += ["--live"]
     if selected_segment is not None:
         command += ["--segment-id=" + selected_segment]
+    if selected_store is not None:
+        command += ["--store-id=" + selected_store]
     operation = "live endpoint readiness" if live else "startup time initialization"
     helper = subprocess.Popen(command, stdout=subprocess.PIPE, start_new_session=True)
     try:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if check_relay is not None:
+                check_relay()
             if desktop.poll() is not None:
                 raise ViewError(f"Native desktop viewer exited before {operation} (status {desktop.returncode}).")
             if ssh is not None and ssh.poll() is not None:
@@ -208,7 +214,7 @@ def initialize_time(desktop: subprocess.Popen, port: int, requested: tuple[str, 
         helper.stdout.close()
 
 
-def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int] | None, *, selected_segment: str | None = None, timeout: float = 120, live: bool = False) -> None:
+def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int] | None, *, selected_segment: str | None = None, timeout: float = 120, live: bool = False, expected_store: str | None = None) -> None:
     import numpy as np
     from rerun.experimental import ViewerClient
 
@@ -233,6 +239,12 @@ def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int] | 
         if (state.loading and not live) or not state.recordings:
             time.sleep(0.1)
             continue
+        if expected_store is not None:
+            if [recording.store_id for recording in state.recordings] != [expected_store]:
+                raise ViewError("Desktop received a different recording than the selected live recording.")
+            if not state.recordings[0].timelines:
+                time.sleep(0.1)
+                continue
         if requested is None:
             return
         if len(state.recordings) != 1:
@@ -379,9 +391,10 @@ def remote_view(binary: Path, host: str, recording: str, resources: dict, reques
         ssh.stdout.close()
 
 
-def live_view(binary: Path, target: str, *, host: str | None = None, port: int = PORT, requested: tuple[str, int] | None = None) -> int:
+def live_view(binary: Path, target: str, *, host: str | None = None, port: int = PORT, requested: tuple[str, int] | None = None, selected_recording: tuple[str, str] | None = None) -> int:
     ssh = None
     desktop = None
+    relay = None
     try:
         if host is not None:
             port_available(port)
@@ -398,9 +411,27 @@ def live_view(binary: Path, target: str, *, host: str | None = None, port: int =
                 time.sleep(0.1)
             target = urlunsplit((url.scheme, f"127.0.0.1:{port}", url.path, url.query, ""))
         control = control_port()
-        desktop = viewer(binary, target, control_port=control)
-        initialize_time(desktop, control, requested, ssh=ssh, live=True)
+        desktop = viewer(binary, None if selected_recording else target, control_port=control)
+        if selected_recording:
+            from ._live import SelectedLiveRelay
+
+            deadline = time.monotonic() + 15
+            while not viewer_listener_owned(desktop.pid, control):
+                if desktop.poll() is not None or time.monotonic() >= deadline:
+                    raise ViewError("The native viewer did not establish its owned loopback listener.")
+                if ssh is not None and ssh.poll() is not None:
+                    raise ViewError("SSH connection ended before selected live attachment.")
+                time.sleep(0.1)
+            relay = SelectedLiveRelay(urlsplit(target).netloc, f"127.0.0.1:{control}", selected_recording)
+            application, identity = selected_recording
+            application = application.replace("\\", "\\\\").replace(":", "\\:")
+            initialize_time(desktop, control, requested, ssh=ssh, live=True,
+                            selected_store=f"Recording:{application}:{identity}", check_relay=relay.check)
+        else:
+            initialize_time(desktop, control, requested, ssh=ssh, live=True)
         while desktop.poll() is None:
+            if relay is not None:
+                relay.check()
             if ssh is not None and ssh.poll() is not None:
                 raise ViewError(f"SSH connection ended (status {ssh.returncode}); the desktop session has been retired.")
             time.sleep(0.2)
@@ -408,6 +439,8 @@ def live_view(binary: Path, target: str, *, host: str | None = None, port: int =
             raise ViewError(f"Native desktop viewer exited with status {desktop.returncode}.")
         return 0
     finally:
+        if relay is not None:
+            relay.close()
         if desktop is not None:
             stop_process(desktop)
         if ssh is not None:
@@ -651,6 +684,7 @@ def parser(command: str | None = None) -> argparse.ArgumentParser:
     elif command in ("_initialize", "_check-live"):
         result.add_argument("--viewer-pid", type=int, required=True)
         result.add_argument("--control-port", type=port_number, required=True)
+        result.add_argument("--store-id")
         if command == "_initialize":
             result.add_argument("--timeline", required=True)
             result.add_argument("--nanoseconds", type=int, required=True)
@@ -658,6 +692,7 @@ def parser(command: str | None = None) -> argparse.ArgumentParser:
             result.add_argument("--live", action="store_true")
     else:
         result.add_argument("target", help="Local .rrd, SSH_ALIAS:/absolute/file.rrd, or [SSH_ALIAS:]rerun+http://LOOPBACK:PORT/proxy")
+        result.add_argument("--recording", nargs=2, metavar=("APPLICATION_ID", "RECORDING_ID"), help="Attach to exactly one live recording")
         result.add_argument("--time", type=startup_time, help="Pause once at TIMELINE=INTEGER_NS after the recording loads")
         result.add_argument("--port", type=port_number, default=None, help=f"Local SSH forwarding port; also the remote file server port (default {PORT})")
         for key in DEFAULT_RESOURCES:
@@ -680,11 +715,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if command == "_initialize":
             requested = startup_time(f"{args.timeline}={args.nanoseconds}")
-            apply_startup_time(args.viewer_pid, args.control_port, requested, selected_segment=args.segment_id, live=args.live)
+            apply_startup_time(args.viewer_pid, args.control_port, requested, selected_segment=args.segment_id, live=args.live, expected_store=args.store_id)
             print(json.dumps({"initialized": True}), flush=True)
             return 0
         if command == "_check-live":
-            apply_startup_time(args.viewer_pid, args.control_port, None, live=True)
+            apply_startup_time(args.viewer_pid, args.control_port, None, live=True, expected_store=args.store_id)
             print(json.dumps({"initialized": True}), flush=True)
             return 0
         if command == "_serve":
@@ -696,9 +731,15 @@ def main(argv: list[str] | None = None) -> int:
             raise ViewError("--port applies only to SSH targets.")
         if (host is None or live) and any(getattr(args, key) is not None for key in DEFAULT_RESOURCES):
             raise ViewError("Resource options apply only to remote files.")
+        selected = tuple(args.recording) if args.recording is not None else None
+        if selected is not None:
+            if not live:
+                raise ViewError("--recording applies only to live targets.")
+            if any(not value.strip() or len(value) > 1024 or not value.isprintable() for value in selected):
+                raise ViewError("--recording requires two nonempty printable IDs of at most 1024 characters each.")
         binary = native_binary()
         if live:
-            return live_view(binary, target, host=host, port=args.port or PORT, requested=args.time)
+            return live_view(binary, target, host=host, port=args.port or PORT, requested=args.time, selected_recording=selected)
         if host is None:
             return local_view(binary, target, args.time) if args.time is not None else local_view(binary, target)
         resources = {key: getattr(args, key) or value for key, value in DEFAULT_RESOURCES.items()}

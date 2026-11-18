@@ -19,6 +19,27 @@ from rerun_remote import cli
 
 
 class TestInputs(unittest.TestCase):
+    def test_live_selection_drops_sibling_metadata_and_foreign_blueprints(self):
+        from rerun_remote._live import _Response, _Selection
+
+        selection = _Selection(("maps", "selected"))
+
+        def store_info(kind, app, identity, *, legacy=""):
+            response = _Response()
+            info = response.log_msg.set_store_info.info
+            info.application_id.id = legacy
+            info.store_id.kind = kind
+            info.store_id.application_id.id = app
+            info.store_id.recording_id = identity
+            return response.SerializeToString()
+
+        self.assertEqual(selection.includes(store_info(1, "maps", "sibling", legacy="wrong")), (False, False))
+        self.assertEqual(selection.includes(store_info(2, "other", "layout")), (False, False))
+        self.assertEqual(selection.includes(store_info(2, "maps", "layout")), (True, False))
+        with self.assertRaisesRegex(cli.ViewError, "conflicting application identities"):
+            selection.includes(store_info(1, "maps", "selected", legacy="wrong"))
+        self.assertEqual(selection.includes(store_info(1, "maps", "selected")), (True, False))
+
     def test_startup_time_preserves_signed_integer_nanoseconds(self):
         for value in ("arrival=1234567890123456789", "duration=-17", "duration=+17", "duration=9223372036854775807", "duration=-9223372036854775807"):
             name, integer = value.split("=")
@@ -37,6 +58,17 @@ class TestInputs(unittest.TestCase):
         self.assertEqual(status, 1)
         native.assert_not_called()
         self.assertIn("Cannot open recording", diagnostic.getvalue())
+
+    def test_live_selection_requires_both_exact_ids_and_refuses_file_targets(self):
+        with patch.object(cli, "native_binary", return_value=Path("/native")) as native, patch.object(cli, "live_view", return_value=0) as view, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as malformed:
+                cli.main(["rerun+http://127.0.0.1:9876/proxy", "--recording", "just-app"])
+            self.assertEqual(malformed.exception.code, 2)
+            self.assertEqual(cli.main(["host:/file.rrd", "--recording", "app", "recording"]), 1)
+            self.assertEqual(cli.main(["rerun+http://127.0.0.1:9876/proxy", "--recording", "app", "\n"]), 1)
+            native.assert_not_called()
+            self.assertEqual(cli.main(["host:rerun+http://127.0.0.1:9876/proxy", "--recording", "app:name", "recording:1"]), 0)
+            self.assertEqual(view.call_args.kwargs["selected_recording"], ("app:name", "recording:1"))
 
     def test_local_metacharacters_are_a_literal_absolute_argument(self):
         with tempfile.TemporaryDirectory() as root:

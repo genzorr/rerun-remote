@@ -19,15 +19,38 @@ import time
 import unittest
 
 
-def producer(port: int) -> None:
+SELECTED_APP = "selected:live-map"
+SELECTED_ID = "11111111-2222-4333-8444-555555555555"
+SELECTED_STORE = r"Recording:selected\:live-map:" + SELECTED_ID
+
+
+def producer(port: int, *, shared: bool = False) -> None:
     import rerun as rr
 
-    recording = rr.RecordingStream("rerun_remote_native_test", recording_id="11111111-2222-4333-8444-555555555555")
+    recording = rr.RecordingStream(SELECTED_APP if shared else "rerun_remote_native_test", recording_id=SELECTED_ID)
     rr.set_sinks(rr.GrpcServerSink(bind_ip="127.0.0.1", port=port), recording=recording)
+    old = []
+    if shared:
+        import rerun.blueprint as rrb
+
+        for application, identity in (("other_app", SELECTED_ID), (SELECTED_APP, "other-run"),
+                                      ("archive", "before-1"), ("archive", "before-2")):
+            history = rr.RecordingStream(application, recording_id=identity)
+            history.connect_grpc(f"rerun+http://127.0.0.1:{port}/proxy")
+            if application == "other_app":
+                history.send_blueprint(rrb.Blueprint(rrb.TimeSeriesView(name="Foreign samples", contents=["old_samples"])))
+            history.set_time("elapsed", duration=0.0)
+            history.log("old_samples", rr.Scalars(-1))
+            history.flush()
+            old.append(history)
+        recording.send_blueprint(rrb.Blueprint(rrb.TimeSeriesView(name="Selected samples", contents=["samples"])))
     tick = 0
     while True:
         recording.set_time("elapsed", duration=tick / 10)
         recording.log("samples", rr.Scalars(tick))
+        if old and tick % 3 == 0:
+            old[0].set_time("elapsed", duration=tick / 10)
+            old[0].log("old_samples", rr.Scalars(-tick))
         tick += 1
         time.sleep(0.1)
 
@@ -53,6 +76,10 @@ class TestNative(unittest.TestCase):
         self.addCleanup(self.stop_all)
         self.environment = dict(os.environ, RERUN_ANALYTICS_ENABLED="false", WGPU_BACKEND="vulkan")
         self.environment.pop("PYTHONPATH", None)
+        if sys.platform == "linux":
+            # The test owns Xvfb even on a workstation with a desktop session.
+            self.environment.pop("WAYLAND_DISPLAY", None)
+            self.environment.pop("WAYLAND_SOCKET", None)
         lavapipe = Path("/usr/share/vulkan/icd.d/lvp_icd.json")
         if lavapipe.exists():
             self.environment["VK_ICD_FILENAMES"] = str(lavapipe)
@@ -199,9 +226,11 @@ class TestNative(unittest.TestCase):
         self.environment["PATH"] = str(commands) + os.pathsep + os.environ["PATH"]
         return "native-test"
 
-    def assert_advancing(self, client) -> None:
+    def assert_advancing(self, client, *, store: str | None = None) -> None:
         def end():
             state = client.get_state()
+            if store is not None:
+                self.assertEqual([recording.store_id for recording in state.recordings], [store])
             recording = state.recordings[0]
             self.assertIn("11111111-2222-4333-8444-555555555555", recording.store_id)
             return next(timeline.end for timeline in recording.timelines if timeline.name == "elapsed")
@@ -248,6 +277,69 @@ class TestNative(unittest.TestCase):
 
     def test_ssh_live_producer_survives_viewer_exit_and_interrupt(self) -> None:
         self.live_attachment(remote=True)
+
+    def test_selected_live_ignores_four_other_recordings_and_bounds_missing(self) -> None:
+        self.selected_attachment(remote=False)
+
+    def test_selected_live_uses_normal_ssh_forwarding(self) -> None:
+        self.selected_attachment(remote=True)
+
+    def selected_attachment(self, *, remote: bool) -> None:
+        port = free_port()
+        source = self.start([sys.executable, str(Path(__file__).resolve()), "_shared_producer", str(port)])
+        deadline = time.monotonic() + 10
+        while True:
+            self.assertIsNone(source.poll(), self.diagnostics())
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    break
+            except OSError:
+                self.assertLess(time.monotonic(), deadline, self.diagnostics())
+                time.sleep(0.1)
+        url = f"rerun+http://127.0.0.1:{port}/proxy"
+        if remote:
+            alias = self.ssh(attach_only=True, multiplex=True)
+            forwarding_port = free_port()
+            arguments = ["--port", str(forwarding_port), f"{alias}:{url}"]
+        else:
+            arguments = [url]
+
+        proxy = socket.socket()
+        self.addCleanup(proxy.close)
+        proxy.bind(("127.0.0.1", 0))
+        proxy.listen()
+        proxy.setblocking(False)
+        self.environment.update(grpc_proxy=f"http://127.0.0.1:{proxy.getsockname()[1]}", no_grpc_proxy="", no_proxy="")
+        time_choice = ("--time", "elapsed=0") if remote else ()
+        process = self.cli(*arguments, "--recording", SELECTED_APP, SELECTED_ID, *time_choice)
+        desktop, client = self.viewer(process)
+        self.assert_advancing(client, store=SELECTED_STORE)
+        self.assertIn("Selected samples", [view.name for view in client.get_state().views])
+        if remote:
+            self.assertEqual(client.get_state().recordings[0].current_time, 0)
+        self.interrupt_cli(process)
+        self.assertEqual(process.wait(timeout=20), 130, self.diagnostics())
+        desktop.wait(timeout=5)
+        with self.assertRaises(BlockingIOError):
+            proxy.accept()
+        self.environment.pop("grpc_proxy")
+        self.assertIsNone(source.poll(), self.diagnostics())
+        if remote:
+            self.assertIsNone(self.master.poll(), "Existing SSH master must survive")
+            with self.assertRaises(OSError):
+                socket.create_connection(("127.0.0.1", forwarding_port), timeout=0.2)
+        else:
+            missing = self.cli(*arguments, "--recording", "missing", SELECTED_ID)
+            self.assertEqual(missing.wait(timeout=28), 1, self.diagnostics())
+            self.assertIn("No data for Rerun application 'missing'", self.diagnostics())
+            generic = self.cli(url)
+            _, unfiltered = self.viewer(generic)
+            deadline = time.monotonic() + 10
+            while len(unfiltered.get_state().recordings) < 5:
+                self.assertLess(time.monotonic(), deadline, self.diagnostics())
+                time.sleep(0.2)
+            self.assertEqual(len(unfiltered.get_state().recordings), 5)
+            self.assertIsNone(source.poll())
 
     def live_attachment(self, *, remote: bool) -> None:
         port = free_port()
@@ -466,7 +558,7 @@ class TestNative(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "_producer":
-        producer(int(sys.argv[2]))
+    if len(sys.argv) == 3 and sys.argv[1] in ("_producer", "_shared_producer"):
+        producer(int(sys.argv[2]), shared=sys.argv[1] == "_shared_producer")
     else:
         unittest.main()
