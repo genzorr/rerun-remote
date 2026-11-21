@@ -1,0 +1,205 @@
+--- a/crates/top/re_viewer/src/ui/open_url_modal.rs
++++ b/crates/top/re_viewer/src/ui/open_url_modal.rs
+@@ -10,6 +10,8 @@
+     modal: ModalHandler,
+     url: String,
+     just_opened: bool,
++    #[cfg(unix)]
++    remote: RemoteOpen,
+
+     /// Used in tests to hide the platform dependent shortcut text.
+     hide_shortcut: bool,
+@@ -19,15 +21,38 @@
+     pub fn open(&mut self) {
+         self.modal.open();
+         self.just_opened = true;
++        #[cfg(unix)]
++        { self.remote.error = None; }
+     }
+
+     pub fn ui(&mut self, ui: &egui::Ui) {
++        #[cfg(unix)]
++        let remote_open = self.remote.poll();
++        #[cfg(unix)]
++        if remote_open {
++            self.url.clear();
++        }
++        #[cfg(unix)]
++        let endpoint = std::env::var_os("RERUN_REMOTE_OPEN_SOCKET");
++        #[cfg(not(unix))]
++        let endpoint: Option<std::ffi::OsString> = None;
++
+         self.modal.ui(
+             ui.ctx(),
+             || ModalWrapper::new("Open from URL"),
+             |ui| {
++                #[cfg(unix)]
++                if remote_open {
++                    ui.close();
++                    return;
++                }
++
+                 ui.horizontal(|ui| {
+-                    ui.strong("Paste a URL below.");
++                    if endpoint.is_some() {
++                        ui.strong("Paste a URL or SSH recording path.");
++                    } else {
++                        ui.strong("Paste a URL below.");
++                    }
+
+                     // Repeat shortcut on the right to remind users of how to open this modal quickly.
+                     if !self.hide_shortcut {
+@@ -64,7 +89,16 @@
+                         accept_extensionless_http: true,
+                     },
+                 );
+-                let can_import = match &open_url {
++                let remote_target = endpoint.is_some() && is_remote_recording(&self.url);
++                #[cfg(unix)]
++                let waiting = self.remote.pending.is_some();
++                #[cfg(not(unix))]
++                let waiting = false;
++                let can_import = if remote_target {
++                    ui.label("SSH recording");
++                    true
++                } else {
++                    match &open_url {
+                     Ok(url) => {
+                         let description = ViewerUrlDescription::from_url(url);
+                         if let Some(target_short) = description.target_short {
+@@ -89,24 +123,39 @@
+                         }
+                         false
+                     }
++                    }
+                 };
++                #[cfg(unix)]
++                if waiting {
++                    ui.spinner();
++                    ui.label("Opening remote recording…");
++                } else if let Some(error) = &self.remote.error {
++                    ui.error_label(error);
++                }
+
+                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                     let button_width = ui.tokens().modal_button_width;
+
+                     let open_response = ui.add_enabled(
+-                        can_import,
++                        can_import && !waiting,
+                         egui::Button::new("Open").min_size(egui::vec2(button_width, 0.0)),
+                     );
+                     if open_response.clicked()
+-                        || can_import && ui.input(|i| i.key_pressed(egui::Key::Enter))
++                        || can_import && !waiting && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                     {
++                        #[cfg(unix)]
++                        if let Some(endpoint) = &endpoint
++                            && remote_target
++                        {
++                            self.remote.send(endpoint.clone(), self.url.clone(), ui.ctx().clone());
++                            return;
++                        }
+                         ui.open_url(egui::OpenUrl::same_tab(self.url.clone()));
+                         ui.close();
+                     }
+
+                     let cancel_response =
+-                        ui.add(egui::Button::new("Cancel").min_size(egui::vec2(button_width, 0.0)));
++                        ui.add_enabled(!waiting, egui::Button::new("Cancel").min_size(egui::vec2(button_width, 0.0)));
+                     if cancel_response.clicked() {
+                         ui.close();
+                     }
+@@ -118,11 +167,92 @@
+     }
+ }
+
++
++fn is_remote_recording(value: &str) -> bool {
++    let Some((alias, path)) = value.split_once(':') else { return false; };
++    alias.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
++        && alias.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
++        && path.starts_with('/')
++        && !path.starts_with("//")
++        && !path.contains(['\n', '\r', '\0'])
++        && path.rsplit_once('.').is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("rrd"))
++}
++
++#[cfg(unix)]
++#[derive(Default)]
++struct RemoteOpen {
++    pending: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
++    error: Option<String>,
++}
++
++#[cfg(unix)]
++impl RemoteOpen {
++    fn poll(&mut self) -> bool {
++        let Some(pending) = &self.pending else { return false; };
++        let result = match pending.try_recv() {
++            Ok(result) => result,
++            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
++            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
++                Err("The remote recording request ended unexpectedly.".to_owned())
++            }
++        };
++        self.pending = None;
++        self.error = result.err();
++        self.error.is_none()
++    }
++
++    fn send(&mut self, endpoint: std::ffi::OsString, target: String, ctx: egui::Context) {
++        let (sender, receiver) = std::sync::mpsc::channel();
++        self.error = None;
++        self.pending = Some(receiver);
++        std::thread::spawn(move || {
++            let result = open_remote(&endpoint, &target);
++            let _ = sender.send(result);
++            ctx.request_repaint();
++        });
++    }
++}
++
++#[cfg(unix)]
++fn open_remote(endpoint: &std::ffi::OsStr, target: &str) -> Result<(), String> {
++    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
++    use std::os::unix::net::UnixStream;
++    use std::time::Duration;
++
++    let exchange = || -> std::io::Result<String> {
++        let mut stream = UnixStream::connect(endpoint)?;
++        stream.set_read_timeout(Some(Duration::from_secs(1320)))?;
++        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
++        writeln!(stream, "{target}")?;
++        let mut result = String::new();
++        BufReader::new(stream).take(4096).read_line(&mut result)?;
++        Ok(result)
++    };
++    let result = exchange().map_err(|error| format!("Cannot reach rerun-remote: {error}"))?;
++    if result == "OK\n" {
++        Ok(())
++    } else if let Some(error) = result.strip_prefix("ERROR ") {
++        Err(error.trim_end().to_owned())
++    } else {
++        Err("rerun-remote did not complete the recording request.".to_owned())
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use parking_lot::Mutex;
+
+     use crate::ui::OpenUrlModal;
++    use super::is_remote_recording;
++
++    #[test]
++    fn recognizes_only_ssh_recording_paths() {
++        assert!(is_remote_recording("recording-server:/data/room one.rrd"));
++        assert!(is_remote_recording("studio.local:/data/run.RRD"));
++        for other in ["https://example.com/a.rrd", "about:recording", "host:relative.rrd", "/data/map.rrd", "-host:/file.rrd"] {
++            assert!(!is_remote_recording(other), "{other}");
++        }
++    }
+
+     #[test]
+     fn test_open_url_modal() {

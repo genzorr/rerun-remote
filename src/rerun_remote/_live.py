@@ -1,4 +1,4 @@
-"""Relay one recording from a Rerun 0.41 message proxy into the owned viewer."""
+"""Relay one recording from a Rerun 0.43 message proxy into the owned viewer."""
 
 import threading
 import time
@@ -19,7 +19,7 @@ _SELECTION_SECONDS = 15
 
 def _response_type():
     # Only decode the store identity. Retain the original envelope, including opaque Arrow chunks and unknown fields.
-    # https://github.com/rerun-io/rerun/tree/0.41.0/crates/store/re_protos/proto/rerun/v1alpha1
+    # https://github.com/rerun-io/rerun/tree/0.43.2/crates/store/re_protos/proto/rerun/v1alpha1
     schema = descriptor_pb2.FileDescriptorProto(name="rerun_remote_proxy", syntax="proto3")
     fields = {
         "ApplicationId": ((1, "id", "string"),),

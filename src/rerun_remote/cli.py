@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+from contextlib import suppress
 import importlib.metadata
 import ipaddress
 import json
 import os
+import queue
 from pathlib import Path
 import re
 import select
@@ -22,8 +24,9 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
-VERSION = "0.41.0"
+VERSION = "0.43.2"
 PORT = 38886
+MAX_REQUEST_BYTES = 8192
 DEFAULT_RESOURCES = {"memory_bytes": 4 * 1024**3, "tasks_max": 128, "runtime_seconds": 7200, "cpu_count": 2}
 CLIENT_INSTALL = "uv tool install --python 3.12 --reinstall --upgrade 'rerun-remote @ git+https://github.com/genzorr/rerun-remote.git@main'"
 SERVER_REPAIR = "Remote runtime is invalid; retry using a fresh isolated XDG_CACHE_HOME, or explicitly update the laptop client."
@@ -32,6 +35,14 @@ ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 class ViewError(RuntimeError):
     """An actionable viewing failure."""
+
+
+class PortOccupied(ViewError):
+    """A requested loopback port belongs to another process."""
+
+
+class RegistrationError(ViewError):
+    """The server rejected a recording without ending the session."""
 
 
 def host_alias(value: str) -> str:
@@ -93,6 +104,11 @@ def native_binary(*, server: bool = False) -> Path:
         bundled = binary.parent / "Rerun.app" / "Contents" / "MacOS" / "Rerun"
         if bundled.exists():
             binary = bundled
+    verify_native_binary(binary, remedy)
+    return binary
+
+
+def verify_native_binary(binary: Path, remedy: str) -> None:
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise ViewError(f"Bundled native Rerun executable is missing or not executable: {binary}. {remedy}")
     try:
@@ -102,7 +118,6 @@ def native_binary(*, server: bool = False) -> Path:
         raise ViewError(f"Cannot run bundled native Rerun. {remedy}") from error
     if not re.search(rf"\brerun(?:-cli)?\s+{re.escape(VERSION)}(?:\s|$)", result.stdout):
         raise ViewError(f"Bundled native Rerun version differs from {VERSION}. {remedy}")
-    return binary
 
 
 def isolated_environment(root: Path) -> dict[str, str]:
@@ -120,7 +135,7 @@ def port_available(port: int = PORT) -> None:
         try:
             probe.bind(("127.0.0.1", port))
         except OSError as error:
-            raise ViewError(f"Loopback port {port} is occupied. Close its owning session or service and retry; its owner was preserved.") from error
+            raise PortOccupied(f"Loopback port {port} is occupied. Close its owning session or service and retry; its owner was preserved.") from error
 
 
 def stop_process(process: subprocess.Popen, *, grace: float = 5) -> None:
@@ -154,9 +169,9 @@ def startup_time(value: str) -> tuple[str, int]:
     return match[1], nanoseconds
 
 
-def viewer(binary: Path, target: str | None, threads: int = 2, *, control_port: int | None = None) -> subprocess.Popen:
+def viewer(binary: Path, target: str | None, threads: int = 2, *, control_port: int | None = None, env: dict[str, str] | None = None) -> subprocess.Popen:
     command = [str(binary), "--bind", "127.0.0.1", "--port", str(control_port) if control_port is not None else "auto", "--threads", str(threads)]
-    return subprocess.Popen(command if target is None else [*command, target], start_new_session=True)
+    return subprocess.Popen(command if target is None else [*command, target], start_new_session=True, env=env)
 
 
 def control_port() -> int:
@@ -181,17 +196,24 @@ def recording_id(store_id: str) -> str:
     raise ViewError("Viewer returned an invalid recording identity.")
 
 
-def initialize_time(desktop: subprocess.Popen, port: int, requested: tuple[str, int] | None, *, selected_segment: str | None = None, ssh: subprocess.Popen | None = None, timeout: float = 120, live: bool = False, selected_store: str | None = None, check_relay: Callable[[], None] | None = None) -> None:
+def initialize_time(desktop: subprocess.Popen, port: int, requested: tuple[str, int] | None, *, selected_segment: str | None = None, ssh: subprocess.Popen | None = None, timeout: float = 120, live: bool = False, selected_store: str | None = None, check_relay: Callable[[], None] | None = None, saved_panels: bool = False) -> None:
     command = [sys.executable, "-m", "rerun_remote", "_initialize" if requested is not None else "_check-live", "--viewer-pid", str(desktop.pid), "--control-port", str(port)]
     if requested is not None:
         command += ["--timeline=" + requested[0], "--nanoseconds=" + str(requested[1])]
         if live:
             command += ["--live"]
+    if saved_panels:
+        command += ["--saved-panels"]
     if selected_segment is not None:
         command += ["--segment-id=" + selected_segment]
     if selected_store is not None:
         command += ["--store-id=" + selected_store]
-    operation = "live endpoint readiness" if live else "startup time initialization"
+    if live:
+        operation = "live endpoint readiness"
+    elif requested is None:
+        operation = "saved recording panel initialization"
+    else:
+        operation = "startup time initialization"
     helper = subprocess.Popen(command, stdout=subprocess.PIPE, start_new_session=True)
     try:
         deadline = time.monotonic() + timeout
@@ -199,6 +221,8 @@ def initialize_time(desktop: subprocess.Popen, port: int, requested: tuple[str, 
             if check_relay is not None:
                 check_relay()
             if desktop.poll() is not None:
+                if saved_panels and requested is None and desktop.returncode == 0:
+                    return
                 raise ViewError(f"Native desktop viewer exited before {operation} (status {desktop.returncode}).")
             if ssh is not None and ssh.poll() is not None:
                 raise ViewError(f"SSH connection ended before {operation} (status {ssh.returncode}).")
@@ -214,7 +238,22 @@ def initialize_time(desktop: subprocess.Popen, port: int, requested: tuple[str, 
         helper.stdout.close()
 
 
-def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int] | None, *, selected_segment: str | None = None, timeout: float = 120, live: bool = False, expected_store: str | None = None) -> None:
+def set_saved_panels(client, recording) -> None:
+    client.get_blueprint(store_id=recording.store_id)
+    panels = {
+        "/blueprint_panel": {"PanelBlueprint": {"state": "Collapsed"}},
+        "/selection_panel": {"PanelBlueprint": {"state": "Collapsed"}},
+        "/time_panel": {"TimePanelBlueprint": {"state": "Collapsed" if recording.timelines else "Hidden"}},
+    }
+    # The pinned ViewerControl protocol supports partial writes, which preserve saved views and playback settings.
+    client._viewer_control("set_blueprint", {
+        "recording": {"store_id": recording.store_id},
+        "mode": "BLUEPRINT_UPDATE_MODE_PARTIAL",
+        "json": json.dumps(panels),
+    })
+
+
+def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int] | None, *, selected_segment: str | None = None, timeout: float = 120, live: bool = False, expected_store: str | None = None, saved_panels: bool = False) -> None:
     import numpy as np
     from rerun.experimental import ViewerClient
 
@@ -245,6 +284,14 @@ def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int] | 
             if not state.recordings[0].timelines:
                 time.sleep(0.1)
                 continue
+        if saved_panels:
+            if selected_segment is not None and [recording_id(recording.store_id) for recording in state.recordings] != [selected_segment]:
+                raise ViewError("Desktop loaded a different recording than the selected remote recording.")
+            if not viewer_listener_owned(viewer_pid, port):
+                raise ViewError("Desktop control listener ownership changed before panel initialization.")
+            for recording in state.recordings:
+                set_saved_panels(client, recording)
+            saved_panels = False
         if requested is None:
             return
         if len(state.recordings) != 1:
@@ -287,11 +334,10 @@ def apply_startup_time(viewer_pid: int, port: int, requested: tuple[str, int] | 
 
 
 def local_view(binary: Path, recording: str, requested: tuple[str, int] | None = None) -> int:
-    port = control_port() if requested is not None else None
-    process = viewer(binary, recording, control_port=port) if requested is not None else viewer(binary, recording)
+    port = control_port()
+    process = viewer(binary, recording, control_port=port)
     try:
-        if requested is not None:
-            initialize_time(process, port, requested)
+        initialize_time(process, port, requested, saved_panels=True)
         return process.wait()
     finally:
         stop_process(process)
@@ -304,8 +350,10 @@ def ssh_command(host: str, local_port: int, remote_port: int, remote_host: str =
     return ["ssh", "-S", "none", "-T", "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-L", f"127.0.0.1:{local_port}:{destination}:{remote_port}", host]
 
 
-def remote_command(host: str, recording: str, resources: dict, port: int = PORT) -> list[str]:
+def remote_command(host: str, recording: str, resources: dict, port: int = PORT, *, open_session: bool = False) -> list[str]:
     argv = ["_serve", "--recording", recording, "--port", str(port)]
+    if open_session:
+        argv += ["--open-session"]
     for key, value in resources.items():
         argv += ["--" + key.replace("_", "-"), str(value)]
     from . import _bootstrap
@@ -314,10 +362,13 @@ def remote_command(host: str, recording: str, resources: dict, port: int = PORT)
     return ssh_command(host, port, port) + [command]
 
 
-def readiness(process: subprocess.Popen, timeout: float = 200, *, port: int = PORT) -> tuple[str, str | None]:
+def readiness(process: subprocess.Popen, timeout: float = 200, *, port: int = PORT,
+              check: Callable[[], None] | None = None, registration: bool = False) -> tuple[str, str | None]:
     deadline = time.monotonic() + timeout
     data = bytearray()
     while time.monotonic() < deadline:
+        if check is not None:
+            check()
         if process.poll() is not None:
             raise ViewError(f"Remote startup failed (SSH status {process.returncode}); check the remote diagnostic above and its installed server profile.")
         if select.select([process.stdout], [], [], min(0.2, deadline - time.monotonic()))[0]:
@@ -330,6 +381,8 @@ def readiness(process: subprocess.Popen, timeout: float = 200, *, port: int = PO
             if b"\n" in data:
                 try:
                     response = json.loads(data.split(b"\n", 1)[0])
+                    if registration and isinstance(response.get("error"), str):
+                        raise RegistrationError(response["error"][:2048])
                     if response["version"] != VERSION:
                         raise ViewError(f"Remote Rerun version must be {VERSION}; explicitly update the laptop client.")
                     if not isinstance(response["segment_url"], str):
@@ -341,8 +394,10 @@ def readiness(process: subprocess.Popen, timeout: float = 200, *, port: int = PO
                     if segment_id is not None and (not isinstance(segment_id, str) or not segment_id):
                         raise ValueError("invalid segment identity")
                     return urlunsplit((url.scheme, f"127.0.0.1:{port}", url.path, url.query, "")), segment_id
-                except (ValueError, KeyError, TypeError) as error:
+                except (AttributeError, ValueError, KeyError, TypeError) as error:
                     raise ViewError("Remote startup returned an invalid readiness response.") from error
+    if registration:
+        raise ViewError("Remote registration timed out.")
     raise ViewError("Remote startup timed out; check SSH authentication, systemd user availability and the selected recording.")
 
 
@@ -371,12 +426,11 @@ def remote_view(binary: Path, host: str, recording: str, resources: dict, reques
         except _bootstrap.SetupError as error:
             raise ViewError(str(error)) from error
         segment_url, segment_id = readiness(ssh, timeout=_bootstrap.SETUP_SECONDS + 200, port=port)
-        control = control_port() if requested is not None else None
         if requested is not None and segment_id is None:
             raise ViewError("Remote startup did not identify the selected recording; retry with a fresh remote cache or update the laptop client.")
-        desktop = viewer(binary, segment_url, resources["cpu_count"], control_port=control) if requested is not None else viewer(binary, segment_url, resources["cpu_count"])
-        if requested is not None:
-            initialize_time(desktop, control, requested, selected_segment=segment_id, ssh=ssh)
+        control = control_port()
+        desktop = viewer(binary, segment_url, resources["cpu_count"], control_port=control)
+        initialize_time(desktop, control, requested, selected_segment=segment_id, ssh=ssh, saved_panels=True)
         while desktop.poll() is None:
             if ssh.poll() is not None:
                 raise ViewError(f"SSH connection ended (status {ssh.returncode}); the desktop session has been retired.")
@@ -506,29 +560,34 @@ def verify_controls(unit: str, resources: dict, pid: int) -> None:
         raise ViewError("Effective session cgroup or CPU affinity differs from its limits; remote startup stopped.")
 
 
-def catalog_recording(client, selected: Path, disconnected: threading.Event) -> tuple[str, str]:
+def catalog_recording(client, selected: Path, disconnected: threading.Event, *, name: str = "selected") -> tuple[str, str]:
     def connected():
         if disconnected.is_set():
             raise ViewError("SSH connection closed during startup.")
     connected()
-    dataset = client.create_dataset("selected")
-    registered = dataset.register([selected.as_uri()]).wait(timeout_secs=60)
-    connected()
-    if len(registered.segment_ids) != 1 or dataset.segment_ids() != registered.segment_ids:
-        raise ViewError("Selected RRD must contain exactly one recording.")
-    blueprint = dataset.blueprint_dataset()
-    if blueprint is None:
-        raise ViewError("Server did not provide its blueprint catalog.")
-    saved_ids = blueprint.register([selected.as_uri()]).wait(timeout_secs=60).segment_ids
-    connected()
-    if len(saved_ids) > 1:
-        raise ViewError("Selected RRD contains multiple saved blueprints; select a recording with one saved blueprint.")
-    if saved_ids:
-        dataset.set_default_blueprint(saved_ids[0])
-    fresh = client.get_dataset("selected")
-    if fresh.default_blueprint() != (saved_ids[0] if saved_ids else None) or fresh.blueprints() != saved_ids:
-        raise ViewError("Saved blueprint did not survive fresh catalog readback.")
-    return fresh.segment_url(registered.segment_ids[0]), registered.segment_ids[0]
+    dataset = client.create_dataset(name)
+    try:
+        registered = dataset.register([selected.as_uri()]).wait(timeout_secs=60)
+        connected()
+        if len(registered.segment_ids) != 1 or dataset.segment_ids() != registered.segment_ids:
+            raise ViewError("Selected RRD must contain exactly one recording.")
+        blueprint = dataset.blueprint_dataset()
+        if blueprint is None:
+            raise ViewError("Server did not provide its blueprint catalog.")
+        saved_ids = blueprint.register([selected.as_uri()]).wait(timeout_secs=60).segment_ids
+        connected()
+        if len(saved_ids) > 1:
+            raise ViewError("Selected RRD contains multiple saved blueprints; select a recording with one saved blueprint.")
+        if saved_ids:
+            dataset.set_default_blueprint(saved_ids[0])
+        fresh = client.get_dataset(name)
+        if fresh.default_blueprint() != (saved_ids[0] if saved_ids else None) or fresh.blueprints() != saved_ids:
+            raise ViewError("Saved blueprint did not survive fresh catalog readback.")
+        return fresh.segment_url(registered.segment_ids[0]), registered.segment_ids[0]
+    except Exception:
+        with suppress(Exception):
+            dataset.delete()
+        raise
 
 
 def serve_worker(args: argparse.Namespace) -> int:
@@ -548,17 +607,30 @@ def serve_worker(args: argparse.Namespace) -> int:
     verify_controls(args.unit, resources, os.getpid())
     port_available(args.port)
     disconnected = threading.Event()
+    requests = queue.Queue(maxsize=1)
     stop_watcher = threading.Event()
     children = []
     child_lock = threading.Lock()
 
     def watch_connection():
         descriptor = sys.stdin.fileno()
+        pending = bytearray()
         while not stop_watcher.is_set():
             if not select.select([descriptor], [], [], 0.2)[0]:
                 continue
-            if not os.read(descriptor, 4096):
+            chunk = os.read(descriptor, 4096)
+            if not chunk:
                 break
+            if args.open_session:
+                pending.extend(chunk)
+                if len(pending) > MAX_REQUEST_BYTES:
+                    break
+                if pending.endswith(b"\n"):
+                    try:
+                        requests.put_nowait(bytes(pending))
+                    except queue.Full:
+                        break
+                    pending.clear()
         else:
             return
         disconnected.set()
@@ -596,13 +668,46 @@ def serve_worker(args: argparse.Namespace) -> int:
                 raise ViewError("Native remote server did not become ready within 60 seconds.")
             if not listener_owned(server.pid, args.port):
                 raise ViewError("Remote loopback listener is not owned by this server; existing catalog preserved.")
-            segment_url, segment_id = catalog_recording(client, selected, disconnected)
-            if disconnected.is_set() or server.poll() is not None:
-                raise ViewError("Remote session ended during recording registration.")
-            print(json.dumps({"version": VERSION, "segment_url": segment_url, "segment_id": segment_id}), flush=True)
-            while not disconnected.wait(0.2):
+            files = {}
+            names = set()
+
+            def register(path: Path) -> dict:
+                if not listener_owned(server.pid, args.port):
+                    raise ViewError("Remote loopback listener ownership changed.")
+                verify_controls(args.unit, resources, server.pid)
+                details = path.stat()
+                identity = (path, details.st_ino, details.st_size, details.st_mtime_ns)
+                if identity not in files:
+                    base = path.stem.replace(".", " ") if args.open_session else "selected"
+                    name = base
+                    sequence = 2
+                    while name in names:
+                        name = f"{base} ({sequence})"
+                        sequence += 1
+                    url, segment = catalog_recording(client, path, disconnected, name=name)
+                    names.add(name)
+                    files[identity] = {"version": VERSION, "segment_url": url, "segment_id": segment}
+                if disconnected.is_set() or server.poll() is not None:
+                    raise ViewError("Remote session ended during recording registration.")
+                return files[identity]
+
+            print(json.dumps(register(selected)), flush=True)
+            while not disconnected.is_set():
                 if server.poll() is not None:
                     raise ViewError(f"Native remote server exited (status {server.returncode}).")
+                try:
+                    raw = requests.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                try:
+                    value = json.loads(raw)
+                    if not isinstance(value, str) or not value.startswith("/") or "\0" in value:
+                        raise ViewError("Recording must be an absolute .rrd path.")
+                    response = register(selected_file(value))
+                except Exception as error:
+                    response = {"error": str(error)[:1000]}
+                if not disconnected.is_set():
+                    print(json.dumps(response), flush=True)
             return 0
         except Exception as error:
             diagnostics.seek(0, os.SEEK_END)
@@ -676,6 +781,7 @@ def parser(command: str | None = None) -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     if command in ("_serve", "_worker"):
         result.add_argument("--recording", required=True)
+        result.add_argument("--open-session", action="store_true")
         result.add_argument("--port", type=port_number, default=PORT)
         if command == "_worker":
             result.add_argument("--unit", required=True)
@@ -685,10 +791,11 @@ def parser(command: str | None = None) -> argparse.ArgumentParser:
         result.add_argument("--viewer-pid", type=int, required=True)
         result.add_argument("--control-port", type=port_number, required=True)
         result.add_argument("--store-id")
+        result.add_argument("--segment-id")
+        result.add_argument("--saved-panels", action="store_true")
         if command == "_initialize":
             result.add_argument("--timeline", required=True)
             result.add_argument("--nanoseconds", type=int, required=True)
-            result.add_argument("--segment-id")
             result.add_argument("--live", action="store_true")
     else:
         result.add_argument("target", help="Local .rrd, SSH_ALIAS:/absolute/file.rrd, or [SSH_ALIAS:]rerun+http://LOOPBACK:PORT/proxy")
@@ -715,11 +822,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if command == "_initialize":
             requested = startup_time(f"{args.timeline}={args.nanoseconds}")
-            apply_startup_time(args.viewer_pid, args.control_port, requested, selected_segment=args.segment_id, live=args.live, expected_store=args.store_id)
+            apply_startup_time(args.viewer_pid, args.control_port, requested, selected_segment=args.segment_id, live=args.live, expected_store=args.store_id, saved_panels=args.saved_panels)
             print(json.dumps({"initialized": True}), flush=True)
             return 0
         if command == "_check-live":
-            apply_startup_time(args.viewer_pid, args.control_port, None, live=True, expected_store=args.store_id)
+            apply_startup_time(args.viewer_pid, args.control_port, None, selected_segment=args.segment_id, live=not args.saved_panels, expected_store=args.store_id, saved_panels=args.saved_panels)
             print(json.dumps({"initialized": True}), flush=True)
             return 0
         if command == "_serve":
@@ -743,6 +850,12 @@ def main(argv: list[str] | None = None) -> int:
         if host is None:
             return local_view(binary, target, args.time) if args.time is not None else local_view(binary, target)
         resources = {key: getattr(args, key) or value for key, value in DEFAULT_RESOURCES.items()}
+        if sys.platform == "darwin":
+            from . import _session
+
+            patched = _session.installed_viewer()
+            if patched is not None:
+                return _session.view(patched, host, target, resources, args.time, port=args.port)
         return remote_view(binary, host, target, resources, args.time, port=args.port or PORT)
     except KeyboardInterrupt:
         return 130
