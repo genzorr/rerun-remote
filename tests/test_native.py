@@ -347,7 +347,15 @@ class TestNative(unittest.TestCase):
         self.assert_advancing(client, store=SELECTED_STORE)
         self.assertIn("Selected samples", [view.name for view in client.get_state().views])
         if remote:
-            self.assertEqual(client.get_state().recordings[0].current_time, 0)
+            deadline = time.monotonic() + 10
+            while True:
+                recording = client.get_state().recordings[0]
+                cursor = (recording.current_timeline, recording.current_time)
+                if cursor == ("elapsed", 0):
+                    break
+                if time.monotonic() >= deadline:
+                    self.assertEqual(cursor, ("elapsed", 0), self.diagnostics())
+                time.sleep(0.1)
         self.interrupt_cli(process)
         self.assertEqual(process.wait(timeout=20), 130, self.diagnostics())
         desktop.wait(timeout=5)
