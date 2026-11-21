@@ -423,6 +423,42 @@ class TestNative(unittest.TestCase):
         self.assertEqual(failed.wait(timeout=25), 1, self.diagnostics())
         self.assertIsNone(source.poll())
 
+    @unittest.skipUnless(sys.platform == "linux", "Requires the Linux catalog worker")
+    def test_catalog_registers_same_basename_and_literal_filename(self) -> None:
+        from importlib.util import find_spec
+
+        from rerun_remote import cli
+        from rerun_remote._session import Catalog
+
+        if find_spec("datafusion") is None:
+            self.skipTest("Requires the server extra")
+        first = self.root / "first" / "room.rrd"
+        second = self.root / "second" / "room.rrd"
+        literal = self.root / "run$final.rrd"
+        for path in (first, second, literal):
+            path.parent.mkdir(exist_ok=True)
+            shutil.copyfile(self.saved, path)
+        port = free_port()
+        # Resource control has its own SSH integration check. Exercise real catalog registration here.
+        command = [
+            sys.executable, "-c",
+            "import sys; from unittest.mock import patch; from rerun_remote import cli; "
+            "patch.object(cli, 'verify_controls').start(); raise SystemExit(cli.main(sys.argv[1:]))",
+            "_worker", "--unit", "test", "--open-session", "--recording", str(first), "--port", str(port),
+        ]
+        process = subprocess.Popen(command, cwd=self.root, env=self.environment, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, start_new_session=True)
+        catalog = Catalog(process, port)
+        try:
+            initial_url, segment = cli.readiness(process, timeout=30, port=port)
+            second_url, second_id = catalog.register(str(second), lambda: None)
+            literal_url, literal_id = catalog.register(str(literal), lambda: None)
+            self.assertEqual((second_id, literal_id), (segment, segment))
+            self.assertEqual(len({initial_url, second_url, literal_url}), 3)
+            self.assertEqual(catalog.register(str(first), lambda: None), (initial_url, segment))
+        finally:
+            catalog.close()
+
     def test_ssh_file_server_with_effective_resource_limits_and_native_catalog_view(self) -> None:
         alias = self.ssh(attach_only=False)
         port = free_port()

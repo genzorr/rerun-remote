@@ -7,6 +7,7 @@ from collections.abc import Callable
 from contextlib import suppress
 import importlib.metadata
 import ipaddress
+from itertools import count
 import json
 import os
 import queue
@@ -669,7 +670,7 @@ def serve_worker(args: argparse.Namespace) -> int:
             if not listener_owned(server.pid, args.port):
                 raise ViewError("Remote loopback listener is not owned by this server; existing catalog preserved.")
             files = {}
-            names = set()
+            recording_numbers = count(1)
 
             def register(path: Path) -> dict:
                 if not listener_owned(server.pid, args.port):
@@ -678,14 +679,9 @@ def serve_worker(args: argparse.Namespace) -> int:
                 details = path.stat()
                 identity = (path, details.st_ino, details.st_size, details.st_mtime_ns)
                 if identity not in files:
-                    base = path.stem.replace(".", " ") if args.open_session else "selected"
-                    name = base
-                    sequence = 2
-                    while name in names:
-                        name = f"{base} ({sequence})"
-                        sequence += 1
+                    # Catalog entry names have stricter rules than Linux filenames.
+                    name = f"recording-{next(recording_numbers)}" if args.open_session else "selected"
                     url, segment = catalog_recording(client, path, disconnected, name=name)
-                    names.add(name)
                     files[identity] = {"version": VERSION, "segment_url": url, "segment_id": segment}
                 if disconnected.is_set() or server.poll() is not None:
                     raise ViewError("Remote session ended during recording registration.")

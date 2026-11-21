@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from codecs import getincrementaldecoder
 from collections.abc import Callable
 from contextlib import ExitStack, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
+from io import BufferedReader
 import json
 import os
 from pathlib import Path
@@ -13,11 +15,14 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from typing import TextIO
 
 from . import _bootstrap, cli
 
 REQUEST_SOCKET = "RERUN_REMOTE_OPEN_SOCKET"
+DIAGNOSTIC_BYTES = 4096
 
 
 def installed_viewer() -> Path | None:
@@ -34,10 +39,26 @@ def installed_viewer() -> Path | None:
     return binary
 
 
+def forward_diagnostics(stream: BufferedReader, output: TextIO, tail: bytearray) -> None:
+    decoder = getincrementaldecoder("utf-8")(errors="replace")
+    with stream:
+        while chunk := stream.read1(DIAGNOSTIC_BYTES):
+            tail.extend(chunk)
+            del tail[:-DIAGNOSTIC_BYTES]
+            with suppress(OSError, ValueError):
+                output.write(decoder.decode(chunk))
+                output.flush()
+        with suppress(OSError, ValueError):
+            output.write(decoder.decode(b"", final=True))
+            output.flush()
+
+
 @dataclass
 class Catalog:
     process: subprocess.Popen
     port: int
+    diagnostic_tail: bytearray = field(default_factory=bytearray)
+    diagnostic_reader: threading.Thread | None = None
 
     def read(self, timeout: float, check: Callable[[], None], *, registration: bool = False) -> tuple[str, str]:
         url, segment = cli.readiness(
@@ -59,6 +80,10 @@ class Catalog:
             cli.retire_ssh(self.process)
         finally:
             self.process.stdout.close()
+            if self.diagnostic_reader is not None and self.diagnostic_reader.ident is not None:
+                self.diagnostic_reader.join(timeout=1)
+            elif self.process.stderr is not None:
+                self.process.stderr.close()
 
 
 def start_catalog(host: str, path: str, resources: dict, requested_port: int | None,
@@ -71,27 +96,30 @@ def start_catalog(host: str, path: str, resources: dict, requested_port: int | N
             if not interactive:
                 command[1:1] = ["-o", "BatchMode=yes"]
             print(f"rerun-remote: preparing catalog on {host}…", file=sys.stderr, flush=True)
-            with tempfile.TemporaryFile() as diagnostics:
-                process = subprocess.Popen(
-                    command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=diagnostics, start_new_session=True,
-                )
-                catalog = Catalog(process, port)
-                try:
-                    _bootstrap.transfer(process, _bootstrap.source_payload())
-                    return catalog, catalog.read(_bootstrap.SETUP_SECONDS + 200, check)
-                except BaseException as error:
-                    catalog.close()
-                    if not isinstance(error, (cli.ViewError, _bootstrap.SetupError, OSError)):
-                        raise
-                    size = diagnostics.seek(0, os.SEEK_END)
-                    diagnostics.seek(max(0, size - 4096))
-                    detail = diagnostics.read(4096).decode(errors="replace").strip()
-                    if f"port {port} is occupied" in detail or "Address already in use" in detail:
-                        raise cli.PortOccupied(f"Loopback port {port} is occupied.") from error
-                    if detail:
-                        raise cli.ViewError(f"{error} {detail}") from error
-                    raise cli.ViewError(str(error)) from error
+            process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, start_new_session=True,
+            )
+            catalog = Catalog(process, port)
+            catalog.diagnostic_reader = threading.Thread(
+                target=forward_diagnostics,
+                args=(process.stderr, sys.stderr, catalog.diagnostic_tail),
+                daemon=True,
+            )
+            try:
+                catalog.diagnostic_reader.start()
+                _bootstrap.transfer(process, _bootstrap.source_payload())
+                return catalog, catalog.read(_bootstrap.SETUP_SECONDS + 200, check)
+            except BaseException as error:
+                catalog.close()
+                if not isinstance(error, (cli.ViewError, _bootstrap.SetupError, OSError)):
+                    raise
+                detail = catalog.diagnostic_tail.decode(errors="replace").strip()
+                if f"port {port} is occupied" in detail or "Address already in use" in detail:
+                    raise cli.PortOccupied(f"Loopback port {port} is occupied.") from error
+                if detail and not interactive:
+                    raise cli.ViewError(f"{error} {detail}") from error
+                raise cli.ViewError(str(error)) from error
         except cli.PortOccupied:
             if requested_port is not None:
                 raise

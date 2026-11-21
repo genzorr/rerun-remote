@@ -650,6 +650,47 @@ class TestCatalog(unittest.TestCase):
 
 
 class TestSession(unittest.TestCase):
+    def test_startup_progress_is_forwarded_before_readiness(self):
+        from rerun_remote import _bootstrap
+        from rerun_remote._session import DIAGNOSTIC_BYTES, start_catalog
+
+        progress = threading.Event()
+
+        class Terminal(io.StringIO):
+            def write(self, value):
+                size = super().write(value)
+                if "preparing remote runtime" in self.getvalue():
+                    progress.set()
+                return size
+
+        url = f"rerun+http://127.0.0.1:{cli.PORT}/dataset/example?segment_id=next"
+        reply = json.dumps({"version": cli.VERSION, "segment_url": url, "segment_id": "next"})
+        code = "\n".join((
+            "import sys",
+            "print('preparing remote runtime', file=sys.stderr, flush=True)",
+            "assert sys.stdin.read(1) == 'x'",
+            "print('reusing prepared remote runtime\\n' + 'a' * 5000 + '\\nlast diagnostic', file=sys.stderr, flush=True)",
+            f"print({reply!r}, flush=True)",
+            "sys.stdin.read()",
+        ))
+
+        def transfer(process, _payload):
+            self.assertTrue(progress.wait(5), "Progress remained hidden while the catalog was starting")
+            process.stdin.write(b"x")
+            process.stdin.flush()
+
+        terminal = Terminal()
+        with contextlib.redirect_stderr(terminal), patch.object(cli, "port_available"), patch.object(cli, "remote_command", return_value=[sys.executable, "-c", code]), patch.object(_bootstrap, "transfer", side_effect=transfer), patch.object(_bootstrap, "source_payload", return_value=b""):
+            catalog, recording = start_catalog("example", "/initial.rrd", cli.DEFAULT_RESOURCES, cli.PORT, lambda: None, interactive=True)
+            try:
+                self.assertEqual(recording, (url, "next"))
+            finally:
+                catalog.close()
+
+        self.assertIn("reusing prepared remote runtime", terminal.getvalue())
+        self.assertTrue(catalog.diagnostic_tail.endswith(b"last diagnostic\n"))
+        self.assertEqual(len(catalog.diagnostic_tail), DIAGNOSTIC_BYTES)
+
     def test_open_selects_new_catalog_recording_with_same_segment_id(self):
         from rerun_remote._session import open_recording
         from rerun.experimental import ViewerClient
