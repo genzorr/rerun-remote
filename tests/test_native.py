@@ -155,7 +155,7 @@ class TestNative(unittest.TestCase):
             self.fail("CLI process was not found under xvfb-run")
         process.send_signal(signal.SIGINT)
 
-    def viewer(self, process, *, timeout: float = 45):
+    def viewer(self, process, *, timeout: float = 45, require_timeline: bool = True):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if process.poll() is not None:
@@ -171,7 +171,7 @@ class TestNative(unittest.TestCase):
                             try:
                                 client = self.ViewerClient.connect(f"rerun+http://127.0.0.1:{connection.laddr.port}/proxy")
                                 state = client.get_state()
-                                if state.recordings and state.recordings[0].timelines:
+                                if state.recordings and (state.recordings[0].timelines or not require_timeline):
                                     return child, client
                             except Exception:
                                 pass
@@ -258,10 +258,29 @@ class TestNative(unittest.TestCase):
         artifacts.mkdir(parents=True, exist_ok=True)
         client.save_screenshot(str(artifacts / f"{name}.png"))
 
+    def assert_panels(self, client, timeline: str) -> None:
+        deadline = time.monotonic() + 10
+        while True:
+            blueprint = client.get_blueprint("recording").blueprint
+            states = tuple(
+                blueprint.get(path, {}).get(archetype, {}).get("state")
+                for path, archetype in (
+                    ("/blueprint_panel", "PanelBlueprint"),
+                    ("/selection_panel", "PanelBlueprint"),
+                    ("/time_panel", "TimePanelBlueprint"),
+                )
+            )
+            if states == ("Collapsed", "Collapsed", timeline):
+                return
+            if time.monotonic() >= deadline:
+                self.assertEqual(states, ("Collapsed", "Collapsed", timeline))
+            time.sleep(0.1)
+
     def test_local_saved_blueprint_and_exact_time(self) -> None:
         process = self.cli(str(self.saved), "--time", "elapsed=1234567890")
         _, client = self.viewer(process)
         self.assert_saved_state(client, "local-saved-blueprint")
+        self.assert_panels(client, "Collapsed")
         self.interrupt_cli(process)
         self.assertEqual(process.wait(timeout=20), 130, self.diagnostics())
 
@@ -271,6 +290,18 @@ class TestNative(unittest.TestCase):
         process = self.cli(str(path))
         _, client = self.viewer(process)
         self.assertIn("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", client.get_state().recordings[0].store_id)
+
+    def test_local_saved_static_hides_timeline(self) -> None:
+        import rerun as rr
+
+        path = self.root / "static map.rrd"
+        recording = rr.RecordingStream("static-map")
+        recording.save(path)
+        recording.log("points", rr.Points3D([[0, 0, 0]]), static=True)
+        recording.disconnect()
+        process = self.cli(str(path))
+        _, client = self.viewer(process, require_timeline=False)
+        self.assert_panels(client, "Hidden")
 
     def test_live_producer_survives_viewer_exit_and_interrupt(self) -> None:
         self.live_attachment(remote=False)
@@ -316,7 +347,15 @@ class TestNative(unittest.TestCase):
         self.assert_advancing(client, store=SELECTED_STORE)
         self.assertIn("Selected samples", [view.name for view in client.get_state().views])
         if remote:
-            self.assertEqual(client.get_state().recordings[0].current_time, 0)
+            deadline = time.monotonic() + 10
+            while True:
+                recording = client.get_state().recordings[0]
+                cursor = (recording.current_timeline, recording.current_time)
+                if cursor == ("elapsed", 0):
+                    break
+                if time.monotonic() >= deadline:
+                    self.assertEqual(cursor, ("elapsed", 0), self.diagnostics())
+                time.sleep(0.1)
         self.interrupt_cli(process)
         self.assertEqual(process.wait(timeout=20), 130, self.diagnostics())
         desktop.wait(timeout=5)
@@ -384,6 +423,42 @@ class TestNative(unittest.TestCase):
         self.assertEqual(failed.wait(timeout=25), 1, self.diagnostics())
         self.assertIsNone(source.poll())
 
+    @unittest.skipUnless(sys.platform == "linux", "Requires the Linux catalog worker")
+    def test_catalog_registers_same_basename_and_literal_filename(self) -> None:
+        from importlib.util import find_spec
+
+        from rerun_remote import cli
+        from rerun_remote._session import Catalog
+
+        if find_spec("datafusion") is None:
+            self.skipTest("Requires the server extra")
+        first = self.root / "first" / "room.rrd"
+        second = self.root / "second" / "room.rrd"
+        literal = self.root / "run$final.rrd"
+        for path in (first, second, literal):
+            path.parent.mkdir(exist_ok=True)
+            shutil.copyfile(self.saved, path)
+        port = free_port()
+        # Resource control has its own SSH integration check. Exercise real catalog registration here.
+        command = [
+            sys.executable, "-c",
+            "import sys; from unittest.mock import patch; from rerun_remote import cli; "
+            "patch.object(cli, 'verify_controls').start(); raise SystemExit(cli.main(sys.argv[1:]))",
+            "_worker", "--unit", "test", "--open-session", "--recording", str(first), "--port", str(port),
+        ]
+        process = subprocess.Popen(command, cwd=self.root, env=self.environment, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, start_new_session=True)
+        catalog = Catalog(process, port)
+        try:
+            initial_url, segment = cli.readiness(process, timeout=30, port=port)
+            second_url, second_id = catalog.register(str(second), lambda: None)
+            literal_url, literal_id = catalog.register(str(literal), lambda: None)
+            self.assertEqual((second_id, literal_id), (segment, segment))
+            self.assertEqual(len({initial_url, second_url, literal_url}), 3)
+            self.assertEqual(catalog.register(str(first), lambda: None), (initial_url, segment))
+        finally:
+            catalog.close()
+
     def test_ssh_file_server_with_effective_resource_limits_and_native_catalog_view(self) -> None:
         alias = self.ssh(attach_only=False)
         port = free_port()
@@ -398,7 +473,7 @@ class TestNative(unittest.TestCase):
         response = process.stdout.readline()
         self.assertTrue(response, self.diagnostics())
         ready = json.loads(response)
-        self.assertEqual(ready["version"], "0.41.0")
+        self.assertEqual(ready["version"], "0.43.2")
         self.assertIn(f"127.0.0.1:{port}/", ready["segment_url"])
         import rerun_cli
         import numpy as np

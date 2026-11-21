@@ -88,8 +88,9 @@ class TestInputs(unittest.TestCase):
             executable.chmod(0o755)
             recording = root / "$(touch surprise); 'literal'.rrd"
             recording.touch()
-            with patch.object(cli, "initialize_time", side_effect=AssertionError("No-time viewing must not use desktop controls")):
+            with patch.object(cli, "initialize_time") as initialize:
                 self.assertEqual(cli.local_view(executable, str(recording)), 0)
+                self.assertTrue(initialize.call_args.kwargs["saved_panels"])
             self.assertEqual(json.loads(output.read_text())[-1], str(recording))
             self.assertFalse((root / "surprise").exists())
 
@@ -302,7 +303,7 @@ class TestVersion(unittest.TestCase):
 
     def test_sdk_mismatch_requires_explicit_update(self):
         with patch.object(cli.importlib.metadata, "version", return_value="0.32.0"), patch.dict(sys.modules, {"rerun_cli": types.SimpleNamespace(__file__="/fake/__init__.py")}):
-            with self.assertRaisesRegex(cli.ViewError, "expected 0.41.0"):
+            with self.assertRaisesRegex(cli.ViewError, "expected 0.43.2"):
                 cli.native_binary()
 
     def test_native_mismatch_requires_explicit_update(self):
@@ -484,7 +485,7 @@ class TestProcesses(unittest.TestCase):
         desktop = self.spawn("import time; time.sleep(60)")
         resources = cli.DEFAULT_RESOURCES
         try:
-            with patch.object(cli, "port_available"), patch.object(cli.subprocess, "Popen", return_value=ssh), patch.object(cli, "viewer", return_value=desktop):
+            with patch.object(cli, "port_available"), patch.object(cli.subprocess, "Popen", return_value=ssh), patch.object(cli, "viewer", return_value=desktop), patch.object(cli, "initialize_time"):
                 with self.assertRaisesRegex(cli.ViewError, "SSH connection ended"):
                     cli.remote_view(Path("/fake/native"), "example", "/recording.rrd", resources)
             self.assertIsNotNone(desktop.poll())
@@ -501,7 +502,7 @@ class TestProcesses(unittest.TestCase):
             ssh = self.spawn("import sys,pathlib; print(" + repr(ready) + ",flush=True); sys.stdin.buffer.read(); pathlib.Path(" + repr(str(marker)) + ").touch()", stdin=subprocess.PIPE, stdout=subprocess.PIPE)
             desktop = self.spawn("pass")
             resources = cli.DEFAULT_RESOURCES
-            with patch.object(cli, "port_available"), patch.object(cli.subprocess, "Popen", return_value=ssh), patch.object(cli, "viewer", return_value=desktop):
+            with patch.object(cli, "port_available"), patch.object(cli.subprocess, "Popen", return_value=ssh), patch.object(cli, "viewer", return_value=desktop), patch.object(cli, "initialize_time"):
                 self.assertEqual(cli.remote_view(Path("/fake/native"), "example", "/recording.rrd", resources), 0)
             self.assertTrue(marker.exists())
             self.assertIsNotNone(ssh.poll())
@@ -527,7 +528,7 @@ class TestProcesses(unittest.TestCase):
                 interrupted = True
                 raise KeyboardInterrupt
             return original_wait(*args, **kwargs)
-        with patch.object(cli, "viewer", return_value=process), patch.object(process, "wait", side_effect=wait):
+        with patch.object(cli, "viewer", return_value=process), patch.object(cli, "initialize_time"), patch.object(process, "wait", side_effect=wait):
             with self.assertRaises(KeyboardInterrupt):
                 cli.local_view(Path("/fake/native"), "/recording.rrd")
         self.assertIsNotNone(process.poll())
@@ -648,6 +649,95 @@ class TestCatalog(unittest.TestCase):
             cli.catalog_recording(client, Path("/recording.rrd"), threading.Event())
 
 
+class TestSession(unittest.TestCase):
+    def test_startup_progress_is_forwarded_before_readiness(self):
+        from rerun_remote import _bootstrap
+        from rerun_remote._session import DIAGNOSTIC_BYTES, start_catalog
+
+        progress = threading.Event()
+
+        class Terminal(io.StringIO):
+            def write(self, value):
+                size = super().write(value)
+                if "preparing remote runtime" in self.getvalue():
+                    progress.set()
+                return size
+
+        url = f"rerun+http://127.0.0.1:{cli.PORT}/dataset/example?segment_id=next"
+        reply = json.dumps({"version": cli.VERSION, "segment_url": url, "segment_id": "next"})
+        code = "\n".join((
+            "import sys",
+            "print('preparing remote runtime', file=sys.stderr, flush=True)",
+            "assert sys.stdin.read(1) == 'x'",
+            "print('reusing prepared remote runtime\\n' + 'a' * 5000 + '\\nlast diagnostic', file=sys.stderr, flush=True)",
+            f"print({reply!r}, flush=True)",
+            "sys.stdin.read()",
+        ))
+
+        def transfer(process, _payload):
+            self.assertTrue(progress.wait(5), "Progress remained hidden while the catalog was starting")
+            process.stdin.write(b"x")
+            process.stdin.flush()
+
+        terminal = Terminal()
+        with contextlib.redirect_stderr(terminal), patch.object(cli, "port_available"), patch.object(cli, "remote_command", return_value=[sys.executable, "-c", code]), patch.object(_bootstrap, "transfer", side_effect=transfer), patch.object(_bootstrap, "source_payload", return_value=b""):
+            catalog, recording = start_catalog("example", "/initial.rrd", cli.DEFAULT_RESOURCES, cli.PORT, lambda: None, interactive=True)
+            try:
+                self.assertEqual(recording, (url, "next"))
+            finally:
+                catalog.close()
+
+        self.assertIn("reusing prepared remote runtime", terminal.getvalue())
+        self.assertTrue(catalog.diagnostic_tail.endswith(b"last diagnostic\n"))
+        self.assertEqual(len(catalog.diagnostic_tail), DIAGNOSTIC_BYTES)
+
+    def test_open_selects_new_catalog_recording_with_same_segment_id(self):
+        from rerun_remote._session import open_recording
+        from rerun.experimental import ViewerClient
+
+        url = "rerun+http://127.0.0.1:38886/dataset/next?segment_id=same"
+        previous = types.SimpleNamespace(store_id="Recording:previous:same", location="about:recording")
+        selected = types.SimpleNamespace(store_id="Recording:next:same", location=url)
+        desktop = types.SimpleNamespace(pid=123)
+        with patch.object(ViewerClient, "connect") as connect, patch.object(cli, "viewer_listener_owned", return_value=True), patch.object(cli, "set_saved_panels") as panels:
+            client = connect.return_value
+            client.get_state.side_effect = [
+                types.SimpleNamespace(viewer_version=cli.VERSION, recordings=[previous]),
+                types.SimpleNamespace(loading=[], recordings=[previous, selected]),
+                types.SimpleNamespace(viewer_version=cli.VERSION, recordings=[previous, selected]),
+                types.SimpleNamespace(loading=[], recordings=[previous, selected]),
+            ]
+            client.open.return_value = types.SimpleNamespace(store_ids=[selected.store_id])
+            open_recording(desktop, 32123, url, "same", lambda: None)
+            open_recording(desktop, 32123, url, "same", lambda: None)
+        panels.assert_called_once_with(client, selected)
+
+    def test_registration_error_keeps_stdin_open_for_another_path(self):
+        from rerun_remote._session import Catalog
+
+        port = 38886
+        good = "/recordings with spaces/map.rrd"
+        url = f"rerun+http://127.0.0.1:{port}/dataset/example?segment_id=next"
+        replies = {"version": cli.VERSION, "segment_url": url, "segment_id": "next"}
+        source = "\n".join((
+            "import json,sys",
+            "assert json.loads(sys.stdin.readline()) == '/missing.rrd'",
+            "print(json.dumps({'error': 'File not found'}), flush=True)",
+            f"assert json.loads(sys.stdin.readline()) == {good!r}",
+            f"print({json.dumps(replies)!r}, flush=True)",
+            "sys.stdin.read()",
+        ))
+        process = subprocess.Popen([sys.executable, "-c", source], stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
+        catalog = Catalog(process, port)
+        try:
+            with self.assertRaisesRegex(cli.RegistrationError, "File not found"):
+                catalog.register("/missing.rrd", lambda: None)
+            self.assertEqual(catalog.register(good, lambda: None), (url, "next"))
+            self.assertIsNone(process.poll())
+        finally:
+            catalog.close()
+
+
 class TestStartupTime(unittest.TestCase):
     def setUp(self):
         from unittest.mock import Mock
@@ -691,7 +781,7 @@ class TestStartupTime(unittest.TestCase):
                 self.client.set_time.assert_called_once()
 
     def test_wrong_recording_and_invalid_timeline_never_seek(self):
-        cases = ((self.state(store="Recording:application:foreign"), "different recording", {"selected_segment": "selected"}), (self.state(timeline="other"), "unavailable", {}), (self.state(time_type="sequence"), "duration or timestamp", {}), (self.state(start=0, end=10), "outside", {}), (self.state(start=None), "outside", {}), (self.state(version="0.38.0"), "expected 0.41.0", {}))
+        cases = ((self.state(store="Recording:application:foreign"), "different recording", {"selected_segment": "selected"}), (self.state(timeline="other"), "unavailable", {}), (self.state(time_type="sequence"), "duration or timestamp", {}), (self.state(start=0, end=10), "outside", {}), (self.state(start=None), "outside", {}), (self.state(version="0.38.0"), "expected 0.43.2", {}))
         for state, diagnostic, kwargs in cases:
             with self.subTest(diagnostic=diagnostic):
                 self.client.reset_mock()
@@ -872,7 +962,7 @@ class TestStartupTime(unittest.TestCase):
                 "    def get_state(self):",
                 "        state=json.loads(FILE.read_text())",
                 "        recording=S(store_id='Recording:application:selected',timelines=[S(name='-arrival',time_type='timestamp',start=0,end=2**63-1)],current_timeline='-arrival',current_time=state['cursor'])",
-                "        return S(viewer_version='0.41.0',loading=[],recordings=[recording])",
+                "        return S(viewer_version='0.43.2',loading=[],recordings=[recording])",
                 "    def set_time(self,timeline,*,timestamp,play_state,recording):",
                 "        assert timeline=='-arrival' and recording=='Recording:application:selected' and play_state=='paused'",
                 "        assert str(timestamp.dtype)=='datetime64[ns]'",
